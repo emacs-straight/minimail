@@ -6,7 +6,7 @@
 ;; Keywords: mail
 ;; URL: https://github.com/astoff/minimail
 ;; Package-Requires: ((emacs "30.1"))
-;; Version: 0.2
+;; Version: 0.3
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -250,7 +250,8 @@ Give up after MAX-TRIES, if that is non-negative."
   :group 'mail)
 
 (defcustom minimail-accounts
-  '((yhetil :incoming-url "imaps://:@yhetil.org/yhetil.emacs"))
+  '((yhetil :incoming-url "imaps://:@yhetil.org/yhetil.emacs"
+            :thread-style hierarchical))
   "Account configuration for the Minimail client.
 This is an alist where keys are names used to refer to each account and
 values are a plist with the following information:
@@ -307,14 +308,16 @@ All entries all optional, except for `:incoming-url'."
   "Maximum number of messages to keep cached in memory."
   :type 'natnum)
 
-(defcustom minimail-mailbox-mode-columns '((\\Sent flags date recipients subject)
-                                           (t flags date from subject))
+(defcustom minimail-mailbox-mode-columns
+  '((\\Sent flag-flagged flag-answered date recipients subject)
+    (t flag-flagged flag-answered date from subject))
   "Columns to display in `minimail-mailbox-mode' buffers.
 This is an alist mapping mailbox selectors to lists of column names as
 defined in `minimail-mailbox-mode-column-alist'."
   :type '(repeat alist))
 
-(defcustom minimail-mailbox-mode-sort-by '((t (date . descend) (thread . ascend)))
+(defcustom minimail-mailbox-mode-sort-by
+  '((t (date . descend) (thread . ascend)))
   "Sorting criteria for `minimail-mailbox-mode' buffers.
 This is an alist mapping mailbox selectors to lists of the form
 
@@ -331,8 +334,26 @@ sorting by thread."
   "Maximum number of messages to fetch at a time when displaying a mailbox."
   :type 'natnum)
 
-(defface minimail-unseen '((t :inherit bold))
-  "Face for unseen messages.")
+(defcustom minimail-thread-style 'shallow
+  "How to display message threads."
+  :type '(choice (const :tag "Shallow" shallow)
+                 (const :tag "Hierarchical" hierarchical)
+                 (const :tag "Don't compute threads" nil)))
+
+(defcustom minimail-subject-faces '(((not \\Seen) . minimail-unseen)
+                                    (t . vtable))
+  "Face to apply to subject strings based on the message flags.
+This is used in `minimail-mailbox-mode' buffers."
+  :type '(repeat alist))
+
+(defface minimail-unseen '((t :weight bold :inherit vtable))
+  "Face to indicate unseen messages.")
+
+(defface minimail-mode-line-loading '((t :inherit mode-line-emphasis))
+  "Face to indicate a background operation in the mode line.")
+
+(defface minimail-mode-line-error '((t :inherit error))
+  "Face to indicate an error in the mode line.")
 
 ;;; Internal variables and helper functions
 
@@ -344,8 +365,6 @@ sorting by thread."
 
 (defvar-local -current-account nil)
 (defvar-local -current-mailbox nil)
-
-(defvar-local -mode-line-suffix nil)
 
 (defvar -minibuffer-update-hook nil
   "Hook run when minibuffer completion candidates are updated.")
@@ -453,7 +472,7 @@ Return the first matching value."
                            (cons mailbox
                                  ;; Due to caching, will essentially never block.
                                  (athunk-run-polling
-                                  (-aget-mailbox-attributes account mailbox)
+                                  (-aget-mailbox-flags account mailbox)
                                   :interval 0.1 :max-tries 10)))
                          val))
           (found val)
@@ -462,7 +481,8 @@ Return the first matching value."
                          '((:fetch-limit . minimail-fetch-limit)
                            (:full-name . user-full-name)
                            (:mail-address . user-mail-address)
-                           (:signature . message-signature))))))))
+                           (:signature . message-signature)
+                           (:thread-style . minimail-thread-style))))))))
 
 (defun -settings-alist-get (keyword account mailbox)
   "Retrieve the most specific configuration value for KEYWORD.
@@ -477,7 +497,7 @@ alist, and look up MAILBOX in it."
           (cons mailbox
                 ;; Due to caching, will essentially never block.
                 (athunk-run-polling
-                 (-aget-mailbox-attributes account mailbox)
+                 (-aget-mailbox-flags account mailbox)
                  :interval 0.1 :max-tries 10))))
   (if-let* ((alist (plist-get (alist-get account minimail-accounts) keyword))
             (val (-assoc-query mailbox alist)))
@@ -497,14 +517,17 @@ alist, and look up MAILBOX in it."
           (push it result))))
     (nreverse result)))
 
+(defun -set-mode-line-suffix (state)
+  (setq mode-line-process
+        (pcase state
+          ('loading
+           `(":" (:propertize "Loading"
+                              face minimail-mode-line-loading)))
+          (`(,error . ,data)
+           `(":" (:propertize "Error"
+                              help-echo ,(format "%s: %s" error data)
+                              face minimail-mode-line-error))))))
 ;;;; vtable hacks
-
-(defvar -vtable-insert-line-hook nil
-  "Hook run after inserting each line of a `vtable'.")
-
-(advice-add #'vtable--insert-line :after
-            (lambda (&rest _) (run-hooks '-vtable-insert-line-hook))
-            '((name . minimail)))
 
 (defun -ensure-vtable (&optional noerror)
   "Return table under point or signal an error.
@@ -699,6 +722,7 @@ it is nil."
   (dquote   ()  (char ?\"))
   (crlf      () "\r\n")
   (anil      () "NIL" `(-- nil))
+  (tagged    () (bol) (char ?T) (+ [0-9]) sp) ;we always format our tags as T<number>
   (untagged  () (bol) "* ")
   (number    () (substring (+ [0-9])) `(s -- (string-to-number s)))
   (achar     () (and (not [cntrl "(){] %*\"\\"]) (any))) ;characters allowed in an atom
@@ -773,7 +797,7 @@ it is nil."
        (item untagged "LIST (" flags ") "
              (or astring anil)
              sp astring7
-             `(f d n -- `(,n (delimiter . ,d) (attributes . ,f))))
+             `(f d n -- `(,n (delimiter . ,d) (flags . ,f))))
        (status untagged "STATUS "
                (list astring7 " ("
                      (* (opt sp)
@@ -853,24 +877,25 @@ it is nil."
                          sp qstring
                          `(s -- '(media-type . "MULTIPART") `(media-subtype . ,s)))
                    ")")
-       ;; (body "BODY " (or body-single body-multi)
-       ;;       `(s -- `(body . ,s)))
-       (body "BODY " ;; (funcall (lambda () (forward-sexp) t))
-             balanced
-             )
+       ;; (body "BODY " (or body-single body-multi) `(s -- `(body . ,s)))
+       (body "BODY " balanced)
        (content "BODY[] " literal `(start end -- `(content ,start . ,end)))
        (flags "FLAGS (" (list (* (opt sp) flag)) ")"
               `(v -- `(flags . ,v)))
        (x-gm-labels "X-GM-LABELS (" (list (* (opt sp) astring7)) ")"
                     `(v -- `(x-gm-labels . ,v)))
+       (thread-id (or (and "THREADID " (or anil (and "(" atom ")")))
+                      (and "X-GM-THRID " number))
+                  `(v -- `(thread-id . ,v)))
+       (email-id (or (and "EMAILID (" atom ")") (and "X-GM-MSGID " number))
+                 `(v -- `(email-id . ,v)))
        (internal-date "INTERNALDATE " imapdate
                      `(v -- `(internal-date . ,v)))
        (size "RFC822.SIZE " number `(n -- `(rfc822-size . ,n)))
        (uid "UID " number `(n -- `(uid . ,n)))
        (item untagged number `(n -- `(id . ,n))
              " FETCH ("
-             (* (opt sp) (or uid flags size envelope body content
-                             internal-date x-gm-labels))
+             (* (opt sp) (or uid flags size envelope content thread-id x-gm-labels))
              ")" crlf))
     (car-safe
      (peg-run (peg (list (* (list item))))))))
@@ -972,10 +997,10 @@ are 1-based and inclusive of the end."
                                (seq-group-by #'car (-parse-list))))))))
       (or cached (setf (-get-in -account-state account 'mailboxes) new)))))
 
-(defun -aget-mailbox-attributes (account mailbox)
-  (athunk-let*
-      ((mailboxes <- (-aget-mailbox-listing account)))
-    (-get-in mailboxes mailbox 'attributes)))
+(defun -aget-mailbox-flags (account mailbox)
+  "Return the list of flags of ACCOUNT's MAILBOX."
+  (athunk-let* ((mailboxes <- (-aget-mailbox-listing account)))
+    (-get-in mailboxes mailbox 'flags)))
 
 (defun -aget-mailbox-status (account mailbox)
   (athunk-let*
@@ -1032,17 +1057,16 @@ If SEQUENTIAL is non-nil, SEQ is regarded as a set of sequential IDs
 rather than UIDs."
   (athunk-let*
       ((caps <- (-aget-capability account))
-       (cmd (format "%sFETCH %s (UID FLAGS%s%s)"
+       (cmd (format "%sFETCH %s (UID FLAGS%s%s%s)"
                     (if sequential "" "UID ")
                     (-format-sequence-set set)
                     (if (memq 'x-gm-ext-1 caps) " X-GM-LABELS" "")
+                    (cond ((memq 'objectid caps) " THREADID")
+                          ((memq 'x-gm-ext-1 caps) " X-GM-THRID")
+                          (t ""))
                     (if brief "" " RFC822.SIZE ENVELOPE")))
-       (buffer <- (-amake-request account mailbox cmd))
-       (messages (with-current-buffer buffer (-parse-fetch))))
-    (when (memq 'x-gm-ext-1 caps)   ;treat GM labels as good old flags
-      (dolist (msg messages)
-        (cl-callf nconc (cdr (assq 'flags msg)) (let-alist msg .x-gm-labels))))
-    messages))
+       (buffer <- (-amake-request account mailbox cmd)))
+    (with-current-buffer buffer (-parse-fetch))))
 
 (defun -afetch-old-messages (account mailbox limit &optional before)
   "Fetch a mailbox message listing with up to LIMIT elements.
@@ -1136,6 +1160,31 @@ messages with UID smaller than BEFORE."
        (_ <- (-amake-request account mailbox cmd)))
     t))
 
+(defun -astore-message-flags (account mailbox uids flags &optional remove)
+  (athunk-let*
+      ((cmd (format "UID STORE %s %sFLAGS (%s)"
+                    (-format-sequence-set uids)
+                    (if remove "-" "+")
+                    (mapconcat (lambda (v) (if (symbolp v) (symbol-name v) v))
+                               (ensure-list flags)
+                               " ")))
+       (buffer <- (-amake-request account mailbox cmd))
+       (result (with-current-buffer buffer (-parse-fetch))))
+    ;; Possibly update displayed mailbox
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when-let* ((table (and (eq -current-account account)
+                                (equal -current-mailbox mailbox)
+                                (derived-mode-p 'minimail-mailbox-mode)
+                                (vtable-current-table))))
+          (dolist (msg (vtable-objects table))
+            (when-let* ((uid (alist-get 'uid msg))
+                        (new (seq-find (lambda (it) (eq (alist-get 'uid it) uid))
+                                       result)))
+              (setf (alist-get 'flags msg) (alist-get 'flags new))
+              (vtable-update-object table msg))))))
+    result))
+
 ;;; Commands
 
 (defun -mailbox-buffer (&optional noerror)
@@ -1158,18 +1207,16 @@ If not found and NOERROR is nil, signal an error."
       (unless (or noerror (buffer-live-p buffer))
         (user-error "No message buffer")))))
 
-(defun -mailbox-annotation (mbx)
-  (let-alist mbx
+(defun -mailbox-annotation (mailbox)
+  "Return an annotation for MAILBOX.
+MAILBOX can be an alist as returned by `minimail--aget-mailbox-listing'
+or a string containing such an alist as a property."
+  (let-alist (if (stringp mailbox) (car (-get-data mailbox)) mailbox)
     (when .messages
       (let ((suffix (if (eq 1 .messages) "" "s")))
         (if (cl-plusp .unseen)
-            (format "%s message%s, %s unseen" .messages suffix .unseen)
-          (format "%s message%s" .messages suffix))))))
-
-(defun -mailbox-annotate (cand)
-  "Return an annotation for `minimail--read-mailbox' candidate CAND."
-  (when-let* ((annot (-mailbox-annotation (car (-get-data cand)))))
-    (format #("  %s" 1 2 (display (space :align-to 40))) annot)))
+            (format " %s message%s, %s unseen" .messages suffix .unseen)
+          (format " %s message%s" .messages suffix))))))
 
 (defun -read-mailbox (prompt &optional accounts)
   "Read the name of a mailbox from one of the ACCOUNTS using PROMPT.
@@ -1182,7 +1229,7 @@ Return a cons cell consisting of the account symbol and mailbox name."
                        (user-error "No accounts configured")))
          (metadata '(metadata
                      (category . minimail-mailbox)
-                     (annotation-function . -mailbox-annotate)))
+                     (annotation-function . -mailbox-annotation)))
          (coll (lambda (string predicate action)
                  (if (eq action 'metadata)
                      metadata
@@ -1197,7 +1244,7 @@ Return a cons cell consisting of the account symbol and mailbox name."
              (athunk-let*
                  ((mkcand (pcase-lambda (`(,mbx . ,props))
                             (unless (-key-match-p '(or \\Noselect \\NonExistent)
-                                                  (alist-get 'attributes props))
+                                                  (alist-get 'flags props))
                               (propertize (-mailbox-display-name acct mbx)
                                           'minimail `(,props ,acct . ,mbx)))))
                   (mailboxes <- (athunk-condition-case err
@@ -1227,12 +1274,12 @@ Return a cons cell consisting of the account symbol and mailbox name."
 (defun -selected-messages ()
   (cond
    ((derived-mode-p 'minimail-message-mode)
-    (error "Not implemented"))
+    (list -current-account -current-mailbox (alist-get 'uid -local-state)))
    ((derived-mode-p 'minimail-mailbox-mode)
     (list -current-account
           -current-mailbox
-          (list (alist-get 'uid (or (vtable-current-object)
-                                    (user-error "No selected message"))))))))
+          (alist-get 'uid (or (vtable-current-object)
+                              (user-error "No selected message")))))))
 
 ;;;###autoload
 (defun minimail-find-mailbox (account mailbox)
@@ -1287,14 +1334,20 @@ Return a cons cell consisting of the account symbol and mailbox name."
                            (buffer-list))))
       (with-current-buffer mbxbuf
         (let* ((table (vtable-current-table))
-               (objs (vtable-objects table)))
-          (dolist (obj objs)
-            (when (memq (alist-get 'uid obj) uids)
-              (vtable-remove-object table obj))))))))
+               (current (when-let* ((msgbuf (alist-get 'message-buffer -local-state))
+                                    (_ (buffer-live-p msgbuf)))
+                          (with-current-buffer msgbuf
+                            (alist-get 'uid -local-state))))
+               (messages (vtable-objects table)))
+          (dolist (msg messages)
+            (when (memq (alist-get 'uid msg) uids)
+              (vtable-remove-object table msg)))
+          (when (memq current uids)     ;move to next message
+            (minimail-show-message)))))))
 
 (defun minimail-move-to-mailbox (&optional destination)
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (pcase-let* ((`(,acct ,mbx ,uids) (-selected-messages))
+  (pcase-let* ((`(,acct ,mbx . ,uids) (-selected-messages))
                (prompt (if (length= uids 1)
                            "Move message to: "
                          (format "Move %s messages to: " (length uids))))
@@ -1302,47 +1355,50 @@ Return a cons cell consisting of the account symbol and mailbox name."
                          (cdr (-read-mailbox prompt (list acct))))))
     (athunk-run (-amove-messages-and-redisplay acct mbx dest uids))))
 
-(defun -find-mailbox-by-attribute (attr mailboxes)
+(defun -find-mailbox-by-flag (flag mailboxes)
+  "Return the first item of MAILBOXES which has the given FLAG.
+FLAG can be a string or, more generally, a condition for
+`minimail--key-match-p'."
   (seq-some (pcase-lambda (`(,mbx . ,items))
-              (when (memq attr (alist-get 'attributes items)) mbx))
+              (when (-key-match-p flag (alist-get 'flags items)) mbx))
             mailboxes))
 
 (defun minimail-move-to-archive ()
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (pcase-let* ((`(,acct ,mbx ,uids) (-selected-messages)))
+  (pcase-let* ((`(,acct ,mbx . ,uids) (-selected-messages)))
     (athunk-run
      (athunk-let*
          ((mailboxes <- (-aget-mailbox-listing acct))
-          (_ <- (let ((dest (or (plist-get (alist-get acct minimail-accounts)
-                                        :archive-mailbox)
-                             (-find-mailbox-by-attribute '\\Archive mailboxes)
-                             (-find-mailbox-by-attribute '\\All mailboxes)
-                             (user-error "Archive mailbox not found"))))
-               (-amove-messages-and-redisplay acct mbx dest uids))))))))
+          (dest (or (plist-get (alist-get acct minimail-accounts)
+                               :archive-mailbox)
+                    (-find-mailbox-by-flag '\\Archive mailboxes)
+                    (-find-mailbox-by-flag '\\All mailboxes)
+                    (user-error "Archive mailbox not found")))
+          (_ <- (-amove-messages-and-redisplay acct mbx dest uids)))))))
 
 (defun minimail-move-to-trash ()
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (pcase-let* ((`(,acct ,mbx ,uids) (-selected-messages)))
+  (pcase-let* ((`(,acct ,mbx . ,uids) (-selected-messages)))
     (athunk-run
      (athunk-let*
          ((mailboxes <- (-aget-mailbox-listing acct))
-          (_ <- (let ((dest (or (plist-get (alist-get acct minimail-accounts)
-                                        :trash-mailbox)
-                             (-find-mailbox-by-attribute '\\Trash mailboxes)
-                             (user-error "Trash mailbox not found"))))
-               (-amove-messages-and-redisplay acct mbx dest uids))))))))
+          (dest (or (plist-get (alist-get acct minimail-accounts)
+                               :trash-mailbox)
+                    (-find-mailbox-by-flag '\\Trash mailboxes)
+                    (user-error "Trash mailbox not found")))
+          (_ <- (-amove-messages-and-redisplay acct mbx dest uids)))))))
 
 (defun minimail-move-to-junk ()
   (interactive nil minimail-mailbox-mode minimail-message-mode)
-  (pcase-let* ((`(,acct ,mbx ,uids) (-selected-messages)))
+  (pcase-let* ((`(,acct ,mbx . ,uids) (-selected-messages)))
     (athunk-run
      (athunk-let*
          ((mailboxes <- (-aget-mailbox-listing acct))
-          (_ <- (let ((dest (or (plist-get (alist-get acct minimail-accounts)
-                                        :junk-mailbox)
-                             (-find-mailbox-by-attribute '\\Junk mailboxes)
-                             (user-error "Junk mailbox not found"))))
-               (-amove-messages-and-redisplay acct mbx dest uids))))))))
+          (dest (or (plist-get (alist-get acct minimail-accounts)
+                               :junk-mailbox)
+                    (-find-mailbox-by-flag '\\Junk mailboxes)
+                    (user-error "Junk mailbox not found")))
+          (_ <- (-amove-messages-and-redisplay acct mbx dest uids)))))))
 
 (defun minimail-execute-server-command (account mailbox command)
   "Execute an IMAP command for debugging purposes."
@@ -1374,6 +1430,10 @@ Return a cons cell consisting of the account symbol and mailbox name."
   "R" #'minimail-reply-all
   "f" #'minimail-forward
   "s" #'minimail-search
+  "A" #'minimail-move-to-archive
+  "J" #'minimail-move-to-junk
+  "D" #'minimail-move-to-trash
+  "M" #'minimail-move-to-mailbox
   "SPC" #'minimail-message-scroll-up
   "S-SPC" #'minimail-message-scroll-down
   "DEL" #'minimail-message-scroll-down)
@@ -1386,12 +1446,10 @@ Return a cons cell consisting of the account symbol and mailbox name."
   "T" #'minimail-toggle-sort-by-thread
   "g" #'revert-buffer)
 
-(define-derived-mode minimail-mailbox-mode special-mode
-  '("Mailbox" -mode-line-suffix)
+(define-derived-mode minimail-mailbox-mode special-mode "Mailbox"
   "Major mode for mailbox listings."
   :interactive nil
   (add-hook 'quit-window-hook #'-quit-message-window nil t)
-  (add-hook '-vtable-insert-line-hook #'-apply-mailbox-line-face nil t)
   (setq-local
    revert-buffer-function #'-mailbox-buffer-refresh
    truncate-lines t))
@@ -1401,7 +1459,7 @@ Return a cons cell consisting of the account symbol and mailbox name."
 Cf. RFC 5256, §2.1."
   (replace-regexp-in-string message-subject-re-regexp "" (downcase string)))
 
-(defun -format-names (addresses &rest _)
+(defun -format-names (addresses)
   (propertize
    (mapconcat
     (lambda (addr)
@@ -1418,9 +1476,7 @@ Cf. RFC 5256, §2.1."
       addresses
       "\n"))))
 
-(defun -format-date (date &rest _)
-  (when (stringp date)
-    (setq date (-get-data date)))
+(defun -format-date (date)
   (let* ((current-time-list nil)
          (timestamp (encode-time date))
          (today (let* ((v (decode-time)))
@@ -1445,24 +1501,6 @@ Cf. RFC 5256, §2.1."
                                       timestamp
                                       (decoded-time-zone date))))))
 
-(defvar minimail-flag-icons             ;TODO: Use define-icon
-  '(((\\Flagged  . "★")
-     ((or $Important \\Important) . #("★" 0 1 (face shadow))))
-    ((\\Answered . "↩")
-     ($Forwarded . "→")
-     ($Junk      . #("⚠" 0 1 (face shadow)))
-     ($Phishing  . #("⚠" 0 1 (face error))))))
-
-(defvar minimail-flag-faces
-  '(((not \\Seen) . minimail-unseen)))
-
-(defun -apply-mailbox-line-face ()
-  (save-excursion
-    (when-let* ((end (prog1 (point) (goto-char (pos-bol 0))))
-                (flags (assq 'flags (vtable-current-object)))
-                (face (-alist-query (cdr flags) minimail-flag-faces)))
-      (add-face-text-property (point) end face))))
-
 (defun -message-timestamp (msg)
   "The message's envelope date as a Unix timestamp."
   (let-alist msg
@@ -1470,6 +1508,48 @@ Cf. RFC 5256, §2.1."
       (encode-time (or .envelope.date
                        .internal-date
                        '(0 0 0 1 1 1970 nil nil 0))))))
+
+(define-icon -message-unseen nil
+  '((emoji "✉️") (symbol "●") (text "."))
+  "Icon for unseen messages."
+  :help-echo "Unseen"
+  :version "0.3")
+
+(define-icon -message-flagged nil
+  '((emoji "⭐") (symbol "★") (text "!"))
+  "Icon for flagged messages."
+  :help-echo "Flagged"
+  :version "0.3")
+
+(define-icon -message-important nil
+  '((emoji "🔸") (symbol "⬥") (text "i"))
+  "Icon for important messages."
+  :help-echo "Important"
+  :version "0.3")
+
+(define-icon -message-answered nil
+  '((emoji "↩️") (symbol "↩") (text "A"))
+  "Icon for answered messages."
+  :help-echo "Answered"
+  :version "0.3")
+
+(define-icon -message-forwarded nil
+  '((emoji "➡️") (symbol "→") (text "F"))
+  "Icon for answered messages."
+  :help-echo "Forwarded"
+  :version "0.3")
+
+(define-icon -message-junk nil
+  '((emoji "♻️") (symbol "♻") (text "J"))
+  "Icon for junk messages."
+  :help-echo "Junk"
+  :version "0.3")
+
+(define-icon -message-phishing nil
+  '((emoji "⚠️") (symbol "⚠") (text "J" :face warning))
+  "Icon for phishing messages."
+  :help-echo "Phishing"
+  :version "0.3")
 
 (defvar minimail-mailbox-mode-column-alist
   ;; NOTE: We must slightly abuse the vtable API in several of our
@@ -1479,24 +1559,33 @@ Cf. RFC 5256, §2.1."
   `((id
      :name "#"
      :getter ,(lambda (msg _) (alist-get 'id msg)))
-    (flags
-     :name ""
-     :width ,(1- (* 2 (length minimail-flag-icons)))
+    (flag-seen
+     :name "Seen"
+     :min-width 1
      :getter ,(lambda (msg _)
-                (let-alist msg
-                  (propertize
-                   (if (assoc-string '\\Seen .flags) "1" "0") ;use columm to sort unread first
-                   'minimail
-                   (propertize
-                    (mapconcat (lambda (column)
-                                 (-alist-query .flags column " "))
-                               minimail-flag-icons
-                               " ")
-                    'help-echo (lambda (&rest _)
-                                 (if .flags
-                                     (string-join (cons "Message flags:" .flags) " ")
-                                   "No message flags"))))))
-     :formatter -get-data)
+                (let ((icon (-alist-query (alist-get 'flags msg)
+                                          '(((not \\Seen) . -message-unseen)))))
+                  (if icon (icon-string icon) ""))))
+    (flag-flagged
+     :name "Flagged"
+     :min-width 1
+     :getter
+     ,(lambda (msg _)
+        (let ((icon (-alist-query (append (alist-get 'x-gm-labels msg)
+                                          (alist-get 'flags msg))
+                                  '((\\Flagged  . -message-flagged)
+                                    ((or $Important \\Important) . -message-important)
+                                    ($Phishing  . -message-phishing)
+                                    ($Junk      . -message-junk)))))
+          (if icon (icon-string icon) ""))))
+    (flag-answered
+     :name "Answered"
+     :min-width 1
+     :getter ,(lambda (msg _)
+                (let ((icon (-alist-query (alist-get 'flags msg)
+                                          '((\\Answered . -message-answered)
+                                            ($Forwarded . -message-forwarded)))))
+                  (if icon (icon-string icon) ""))))
     (from
      :name "From"
      :max-width 30
@@ -1519,17 +1608,19 @@ Cf. RFC 5256, §2.1."
                                          .envelope.bcc)))))
     (subject
      :name "Subject"
-     :max-width 60
-     :getter ,(lambda (msg tbl)
+     :max-width 80
+     :getter ,(lambda (msg _tbl)
                 (let-alist msg
                   (propertize (let ((s (-base-subject (or .envelope.subject ""))))
                                 (if (string-empty-p s) "\0" s))
-                              'minimail `((table . ,tbl) ,@msg))))
+                              'minimail msg)))
      :formatter ,(lambda (s)
                    (let-alist (-get-data s)
-                     (concat (when (alist-get 'sort-by-thread -local-state)
-                               (-thread-subject-prefix .uid))
-                             (or .envelope.subject "")))))
+                     (concat
+                      (when (alist-get 'sort-by-thread -local-state)
+                        (-thread-subject-prefix .uid))
+                      (propertize (or .envelope.subject "")
+                                  'face (-alist-query .flags minimail-subject-faces))))))
     (date
      :name "Date"
      :width 12
@@ -1538,7 +1629,15 @@ Cf. RFC 5256, §2.1."
                 ;; hex string.  This ensures the correct sorting.
                 (propertize (format "%09x" (-message-timestamp msg))
                             'minimail (let-alist msg .envelope.date)))
-     :formatter -format-date)))
+     :formatter ,(lambda (s)
+                   (propertize (-format-date (-get-data s))
+                               'face 'vtable)))
+    (size
+     :name "Size"
+     :getter ,(lambda (msg _) (let-alist msg .rfc822-size))
+     :formatter ,(lambda (v)
+                   (propertize (file-size-human-readable-iec v)
+                               'face 'vtable)))))
 
 (defun -mailbox-buffer-update (messages)
   "Set vtable objects to MESSAGES and do all necessary adjustments."
@@ -1548,7 +1647,14 @@ Cf. RFC 5256, §2.1."
     (when-let* ((msg (seq-find (lambda (msg) (let-alist msg (eq .uid uid)))
                                messages)))
       (vtable-goto-object msg)))
-  (setq -thread-tree (-thread-by-subject messages))
+  (setq -thread-tree (funcall (pcase-exhaustive
+                                  (-settings-scalar-get :thread-style
+                                                        -current-account
+                                                        -current-mailbox)
+                                ('shallow #'-thread-tree-shallow)
+                                ('hierarchical #'-thread-tree-hierarchical)
+                                ('nil #'ignore))
+                              messages))
   (when-let* ((how (alist-get 'sort-by-thread -local-state)))
     (-sort-messages-by-thread (eq how 'descend)))
   (save-excursion
@@ -1570,7 +1676,7 @@ Cf. RFC 5256, §2.1."
          (mailbox -current-mailbox)
          (limit (-settings-scalar-get :fetch-limit account mailbox))
          (search (alist-get 'search -local-state)))
-    (setq -mode-line-suffix ":Loading")
+    (-set-mode-line-suffix 'loading)
     (athunk-run
      (athunk-let*
          ((messages <- (athunk-condition-case err
@@ -1578,10 +1684,10 @@ Cf. RFC 5256, §2.1."
                                (-afetch-search account mailbox search limit)
                              (-afetch-old-messages account mailbox limit))
                          (t (with-current-buffer buffer
-                              (setq -mode-line-suffix ":Error"))
+                              (-set-mode-line-suffix err))
                             (signal (car err) (cdr err))))))
        (with-current-buffer buffer
-         (setq -mode-line-suffix nil)
+         (-set-mode-line-suffix nil)
          (let* ((inhibit-read-only t)
                 (vtable-map (make-sparse-keymap)) ;only way to disable extra keymap
                 (colnames (-settings-alist-get :mailbox-columns account mailbox))
@@ -1589,9 +1695,6 @@ Cf. RFC 5256, §2.1."
            (make-vtable
             :objects messages ;Ideally we would create the table empty
                               ;and populate later
-            :face 'default ;FIXME: Sorting trick and unread face break
-                           ;variable pitch display, likely solved in
-                           ;Emacs 31.
             :columns (mapcar (lambda (v)
                                (alist-get v minimail-mailbox-mode-column-alist))
                              colnames)
@@ -1612,16 +1715,16 @@ Cf. RFC 5256, §2.1."
          (messages (vtable-objects (-ensure-vtable)))
          (search (alist-get 'search -local-state)))
     (when search (error "Not implemented"))
-    (setq -mode-line-suffix ":Loading")
+    (-set-mode-line-suffix 'loading)
     (athunk-run
      (athunk-let*
          ((messages <- (athunk-condition-case err
                            (-afetch-new-messages account mailbox messages)
                          (t (with-current-buffer buffer
-                              (setq -mode-line-suffix ":Error"))
+                              (-set-mode-line-suffix err))
                             (signal (car err) (cdr err))))))
        (with-current-buffer buffer
-         (setq -mode-line-suffix nil)
+         (-set-mode-line-suffix nil)
          (-mailbox-buffer-update messages))))))
 
 (defun minimail-load-more-messages (&optional count)
@@ -1636,16 +1739,16 @@ Cf. RFC 5256, §2.1."
          (limit (or count (-settings-scalar-get :fetch-limit account mailbox)))
          (before (seq-min (mapcar (lambda (msg) (let-alist msg .uid)) messages))))
     (when search (error "Not implemented"))
-    (setq -mode-line-suffix ":Loading")
+    (-set-mode-line-suffix 'loading)
     (athunk-run
      (athunk-let*
          ((old <- (athunk-condition-case err
                       (-afetch-old-messages account mailbox limit before)
                     (t (with-current-buffer buffer
-                         (setq -mode-line-suffix ":Error"))
+                         (-set-mode-line-suffix err))
                        (signal (car err) (cdr err))))))
        (with-current-buffer buffer
-         (setq -mode-line-suffix nil)
+         (-set-mode-line-suffix nil)
          (unless old (user-error "No more old messages"))
          (-mailbox-buffer-update (nconc old messages)))))))
 
@@ -1663,8 +1766,8 @@ Cf. RFC 5256, §2.1."
                           (-message-buffer-name account mailbox ""))))))
     (let-alist message
       (unless (member "\\Seen" .flags)
-        (push "\\Seen" (cdr (assq 'flags message))))
-      (vtable-update-object (vtable-current-table) message)
+        (push "\\Seen" (cdr (assq 'flags message)))
+        (vtable-update-object (vtable-current-table) message))
       (setq-local overlay-arrow-position (copy-marker (pos-bol)))
       (with-current-buffer msgbuf
         (-display-message account mailbox .uid)
@@ -1731,23 +1834,56 @@ If KILL is non-nil, kill the message buffer instead of burying it."
   "A prefix added to message subjects when sorting by thread."
   (make-string (* 2 (or (-thread-level uid) 0)) ?\s))
 
-(defun -thread-by-subject (messages)
-  "Compute a message thread tree from MESSAGES based on subject strings.
-This is the ORDEREDSUBJECT algorithm described in RFC 5256.  The return
-value is as described in loc. cit. §4, with message UIDs as tree leaves."
+(defun -thread-tree-shallow (messages)
+  "Compute a shallow message thread tree from MESSAGES.
+Use server-side thread identifiers if available; otherwise, infer the
+thread structure from the message sujects, as in the ORDEREDSUBJECT
+algorithm described in RFC 5256.  The return value is as described in
+loc. cit. §4, with message UIDs as tree leaves."
   (let* ((hash (make-hash-table :test #'equal))
          (threads (progn
                     (dolist (msg messages)
                       (let-alist msg
-                        (push msg (gethash (-base-subject (or .envelope.subject ""))
+                        (push msg (gethash (or .thread-id
+                                               (-base-subject
+                                                (or .envelope.subject "")))
                                            hash))))
-                    (mapcar (lambda (thread) (sort thread :key #'-message-timestamp))
-                            (hash-table-values hash))))
-         (sorted (sort threads :key (lambda (v) (-message-timestamp (car v))))))
+                    (mapcar (lambda (thread)
+                              (sort thread :key #'-message-timestamp :in-place t))
+                            (hash-table-values hash)))))
     (mapcar (lambda (thread)
               (cons (let-alist (car thread) .uid)
                     (mapcar (lambda (v) (let-alist v (list .uid))) (cdr thread))))
-            sorted)))
+            threads)))
+
+(defun -thread-tree-hierarchical (messages)
+  "Compute a hierarchical message thread tree from MESSAGES.
+This relies solely on Message-ID and In-Reply-To headers from the IMAP
+envelope and doesn't use server-side threading information.  The return
+value is as described in RFC 5256, §4, with message UIDs as tree leaves."
+  (let* ((msgid (make-hash-table :test #'equal)) ;map Message-ID -> UID
+         (children (make-hash-table))            ;map UID -> list of children messages
+         (roots nil))                            ;list of root messages
+    (dolist (msg messages)
+      (let-alist msg
+        (when .envelope.message-id
+          (puthash .envelope.message-id .uid msgid))))
+    (dolist (msg messages)
+      (if-let* ((inreply (let-alist msg
+                           (and .envelope.in-reply-to
+                                (string-match "<.*?>" .envelope.in-reply-to)
+                                (match-string-no-properties 0 .envelope.in-reply-to))))
+                (parent (gethash inreply msgid)))
+          (push msg (gethash parent children))
+        (push msg roots)))
+    (cl-labels
+        ((recur (msg)
+           (let-alist msg
+             (pcase (gethash .uid children)
+               ('nil (list .uid))
+               (`(,one) (cons .uid (recur one)))
+               (many (cons .uid (mapcar #'recur (sort many :key #'-message-timestamp))))))))
+      (mapcar #'recur roots))))
 
 (defun -sort-messages-by-thread (&optional descend)
   "Sort messages with grouping by threads.
@@ -1757,8 +1893,7 @@ preserve the existing order, in the sense that thread A sorts before
 thread B if some message from A comes before all messages of B.  This
 makes sense when the current sort order is in the “most relevant at top”
 style.  If DESCEND is non-nil, use the opposite convention."
-  (let* ((table (or (vtable-current-table)
-                    (user-error "No table under point")))
+  (let* ((table (-ensure-vtable))
          (mhash (make-hash-table)) ;maps message id -> root id and position within thread
          (rhash (make-hash-table)) ;maps root id -> position across threads
          (lessp (lambda (o1 o2)
@@ -1820,8 +1955,7 @@ style.  If DESCEND is non-nil, use the opposite convention."
   :parent (make-composed-keymap (list minimail-base-keymap button-buffer-map)
                                 special-mode-map))
 
-(define-derived-mode minimail-message-mode special-mode
-  '("Message" -mode-line-suffix)
+(define-derived-mode minimail-message-mode special-mode "Message"
   "Major mode for email messages."
   :interactive nil
   (setq buffer-undo-list t))
@@ -1854,7 +1988,7 @@ window shorter than 6 lines."
         (buffer (current-buffer)))
     (unless (derived-mode-p #'minimail-message-mode)
       (minimail-message-mode))
-    (setq -mode-line-suffix ":Loading")
+    (-set-mode-line-suffix 'loading)
     (setf (alist-get 'next-message -local-state)
           (list account mailbox uid))
     (athunk-run
@@ -1862,14 +1996,14 @@ window shorter than 6 lines."
          ((text <- (athunk-condition-case err
                        (-afetch-message-body account mailbox uid)
                      (t (with-current-buffer buffer
-                          (setq -mode-line-suffix ":Error"))
+                          (-set-mode-line-suffix err))
                         (signal (car err) (cdr err))))))
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (when (equal (alist-get 'next-message -local-state)
                         (list account mailbox uid))
              (let ((inhibit-read-only t))
-               (setq -mode-line-suffix nil)
+               (-set-mode-line-suffix nil)
                (funcall -message-erase-function)
                (setq -current-account account)
                (setq -current-mailbox mailbox)
@@ -1918,6 +2052,9 @@ window shorter than 6 lines."
       (select-window window))
     (let ((message-mail-user-agent 'minimail)
           (message-reply-buffer (current-buffer))
+          (account -current-account)
+          (mailbox -current-mailbox)
+          (uid (alist-get 'uid -local-state))
           (msgid (alist-get 'message-id -local-state))
           (refs (alist-get 'references -local-state)))
       (message-reply to-address wide)
@@ -1929,6 +2066,11 @@ window shorter than 6 lines."
           (when refs (insert refs ?\s))
           (insert msgid ?\n)
           (narrow-to-region (point) (point-max))))
+      (push (lambda ()
+              (athunk-run
+               (-astore-message-flags account mailbox uid '\\Answered)))
+            ;;FIXME: Use this or rather `message-sent-hook'?
+            message-send-actions)
       (when cite (message-yank-original)))))
 
 (defun minimail-reply-all (cite &optional to-address)
@@ -1942,8 +2084,15 @@ window shorter than 6 lines."
   (with-current-buffer (-message-buffer)
     (when-let* ((window (get-buffer-window)))
       (select-window window))
-    (let ((message-mail-user-agent 'minimail))
-      (message-forward))))
+    (let ((message-mail-user-agent 'minimail)
+          (account -current-account)
+          (mailbox -current-mailbox)
+          (uid (alist-get 'uid -local-state)))
+      (message-forward)
+      (push (lambda ()
+              (athunk-run
+               (-astore-message-flags account mailbox uid '$Forwarded)))
+            message-send-actions))))
 
 ;;;; Gnus graft
 ;; Cf. `mu4e--view-render-buffer' from mu4e-view.el
@@ -2000,43 +2149,115 @@ window shorter than 6 lines."
 (defvar-keymap minimail-overview-mode-map
   :parent (make-composed-keymap widget-keymap special-mode-map))
 
-(define-derived-mode minimail-overview-mode special-mode
-  '("Minimail" -mode-line-suffix)
+(define-derived-mode minimail-overview-mode special-mode "Minimail"
   "Major mode for browsing a mailbox tree."
   :interactive nil
   (setq buffer-undo-list t)
-  (tree-widget-set-theme "folder")
+  (add-hook 'tree-widget-before-create-icon-functions #'-overview-create-icon nil t)
   (setq-local revert-buffer-function (lambda (&rest _)
                                        (-overview-buffer-populate t))))
+
+(define-icon -mailbox nil
+  '((emoji "🗂️") (text ""))
+  "Generic icon for mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-closed -mailbox
+  '((emoji "📁") (symbol "⊞ ")(text "[+]"))
+  "Icon for mailboxes with children, when closed."
+  :version "0.3")
+
+(define-icon -mailbox-open -mailbox
+  '((emoji "📂") (symbol "⊟ ") (text "[-]"))
+  "Icon for mailboxes with children, when open."
+  :version "0.3")
+
+(define-icon -mailbox-archive -mailbox
+  '((emoji "🗃️"))
+  "Icon for archive mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-drafts -mailbox
+  '((emoji "📝"))
+  "Icon for drafts mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-flagged -mailbox
+  '((emoji "⭐"))
+  "Icon for flagged mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-important -mailbox
+  '((emoji "🔶"))
+  "Icon for important mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-inbox -mailbox
+  '((emoji "📥"))
+  "Icon for inbox mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-junk -mailbox
+  '((emoji "♻️"))
+  "Icon for junk mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-sent -mailbox
+  '((emoji "📤"))
+  "Icon for sent mailboxes."
+  :version "0.3")
+
+(define-icon -mailbox-trash -mailbox
+  '((emoji "🗑️"))
+  "Icon for trash mailboxes."
+  :version "0.3")
+
+(defun -overview-create-icon (icon)
+  (widget-put icon :glyph-name nil)
+  (widget-put icon :tag
+              (icon-string
+               (pcase (widget-type icon)
+                 ('tree-widget-leaf-icon
+                  (widget-put icon :tab-order -1)
+                  (widget-get (widget-get icon :node) :icon))
+                 ('tree-widget-open-icon '-mailbox-open)
+                 (_ '-mailbox-closed)))))
 
 (defun -overview-tree-expand (widget)
   (let ((acct (widget-get widget :account))
         (path (widget-get widget :path)))
     (mapcan
-     (lambda (mbx)
-       (let-alist mbx
+     (pcase-lambda (`(,name . ,props))
+       (let-alist props
          (when (equal path (cdr .path))
-           (let ((node (if (-key-match-p '(or \\Noselect \\NonExistent) .attributes)
+           (let ((node (if (-key-match-p '(or \\Noselect \\NonExistent) .flags)
                            `(item :tag ,(car .path))
                          `(link :tag ,(car .path)
                                 :format "%[%t%]%d"
                                 :button-prefix ""
                                 :button-suffix ""
-                                :doc ,(if-let* ((annot (-mailbox-annotation mbx)))
-                                          (format #(" %s" 1 3 (face completions-annotations))
-                                                  annot)
-                                        "")
-                                :action
-                                ,(lambda (&rest _)
-                                   (minimail-find-mailbox acct .name))))))
-             (if (-key-match-p '\\HasNoChildren .attributes)
+                                :doc ,(propertize (or (-mailbox-annotation props) "")
+                                                  'face 'completions-annotations)
+                                :icon ,(seq-some
+                                        (pcase-lambda (`(,cond . ,icon))
+                                          (when (-key-match-p cond .flags) icon))
+                                        '(((or \\All \\Archive) . -mailbox-archive)
+                                          (\\Drafts             . -mailbox-drafts)
+                                          (\\Flagged            . -mailbox-flagged)
+                                          (\\Important          . -mailbox-important)
+                                          (\\Junk               . -mailbox-junk)
+                                          (\\Sent               . -mailbox-sent)
+                                          (\\Trash              . -mailbox-trash)
+                                          (t                    . -mailbox)))
+                                :action ,(lambda (&rest _)
+                                           (minimail-find-mailbox acct name))))))
+             (if (-key-match-p '(or \\HasNoChildren \\Noinferiors) .flags)
                  `(,node)
                `((tree-widget
-                  :tag ,(car .path)
+                  :node ,node
                   :account ,acct
                   :path ,.path
-                  :expander -overview-tree-expand
-                  :node ,node)))))))
+                  :expander -overview-tree-expand)))))))
      (widget-get (alist-get acct -tree-widgets) :mailboxes))))
 
 (defun -overview-buffer-populate (&optional refresh)
@@ -2046,7 +2267,7 @@ Unless REFRESH is non-nil, use cached mailbox information."
         (buffer (current-buffer))
         (accounts (or (mapcar #'car minimail-accounts)
                       (user-error "No accounts configured"))))
-    (setq -mode-line-suffix ":Loading")
+    (-set-mode-line-suffix 'loading)
     (when (and (bolp) (eolp))
       (dolist (acct accounts)
         (setf (alist-get acct -tree-widgets)
@@ -2063,9 +2284,9 @@ Unless REFRESH is non-nil, use cached mailbox information."
        (athunk-let*
            ((mailboxes <- (athunk-condition-case err
                               (-aget-mailbox-listing acct refresh)
-                            (t (setq -mode-line-suffix ":Error")
+                            (t (-set-mode-line-suffix err)
                                (signal (car err) (cdr err)))))
-            ;; Add name an path property to the mailbox items.
+            ;; Add path property to the mailbox items.
             (props (alist-get acct minimail-accounts))
             (url (url-generic-parse-url (plist-get props :incoming-url)))
             (basepath (string-remove-prefix "/" (car (url-path-and-query url))))
@@ -2078,12 +2299,12 @@ Unless REFRESH is non-nil, use cached mailbox information."
                                                 (split-string
                                                  (string-remove-prefix basepath name)
                                                  (regexp-quote delim) t)))))
-                                   `((name . ,name) (path . ,path) ,@props)))
+                                   `(,name (path . ,path) ,@props)))
                                mailboxes)))
          (with-current-buffer buffer
            (widget-put (alist-get acct -tree-widgets) :mailboxes mailboxes)
            (cl-remf accounts acct)
-           (unless accounts (setq -mode-line-suffix nil))
+           (unless accounts (-set-mode-line-suffix nil))
            (let ((tree (alist-get acct -tree-widgets)))
              (when (widget-get tree :open)
                ;; Close and open to refresh children.

@@ -1,2 +1,2 @@
 ;; Generated package description from minimail.el  -*- mode: lisp-data; no-byte-compile: t -*-
-(define-package "minimail" "0.2.0.20251101.84006" "Simple, non-blocking IMAP email client" '((emacs "30.1")) :commit "fb2012c9390bfafc8664c58924480d3f0048938c" :authors '(("Augusto Stoffel" . "arstoffel@gmail.com")) :maintainer '("Augusto Stoffel" . "arstoffel@gmail.com") :keywords '("mail") :url "https://github.com/astoff/minimail")
+(define-package "minimail" "0.3.0.20251125.163059" "Simple, non-blocking IMAP email client" '((emacs "30.1")) :commit "897abe9606a8b1074d27b6b0da6ca67eb6e9606a" :authors '(("Augusto Stoffel" . "arstoffel@gmail.com")) :maintainer '("Augusto Stoffel" . "arstoffel@gmail.com") :keywords '("mail") :url "https://github.com/astoff/minimail")
