@@ -1,7 +1,7 @@
 #+title: Minimail
 
 #+html: <a href="https://elpa.gnu.org/packages/minimail.html"><img alt="GNU ELPA" src="https://elpa.gnu.org/packages/minimail.svg"/></a>
-#+html: <img src="https://raw.githubusercontent.com/astoff/minimail/refs/heads/images/monolith.jpg" align="right" width="50%">
+#+html: <img src="https://codeberg.org/astoff/minimail/raw/branch/images/monolith.jpg" align="right" width="50%">
 
 Minimail is a simple, non-blocking IMAP email client for Emacs.  It is
 a rather new package but covers the basics needed for reading and
@@ -22,7 +22,6 @@ replying to messages:
 Here is a list of planned features:
 
 - Structured search (by sender, subject, etc.)
-- Marking and operating on sets of messages (move, etc.)
 - Watching for new messages and notifications
 - Login via OAuth
 - Various optimizations, perhaps a persistent cache
