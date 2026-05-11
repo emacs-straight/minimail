@@ -5,7 +5,7 @@
 ;; Author: Augusto Stoffel <arstoffel@gmail.com>
 ;; Keywords: mail
 ;; URL: https://codeberg.org/astoff/minimail
-;; Package-Requires: ((emacs "30.1") (transient "0.12"))
+;; Package-Requires: ((emacs "30.1") (compat "31") (transient "0.12"))
 ;; Version: 0.4.2
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -76,7 +76,7 @@
           (goto-char pos)
           (format "%s:%s:%s"
                   (file-name-nondirectory byte-compile-current-file)
-                  (1+ (count-lines (point-min) (pos-bol)))
+                  (line-number-at-pos)
                   (1+ (current-column)))))
      ,(macroexp-progn body)))
 
@@ -132,7 +132,7 @@ Return an athunk which resolves to the value of the last form in BODY."
            (if err
                (funcall cont err val)
              (setf (aref result i) val)
-             (when (zerop (cl-decf n))
+             (when (zerop (decf n))
                (run-with-timer 0 nil cont nil result)))))))))
 
 (defmacro athunk-let (bindings &rest body)
@@ -158,7 +158,7 @@ Return an athunk which resolves to the value of the last form in BODY."
 
 (defun athunk-run (athunk)
   "Execute ATHUNK for side-effects.
-Any uncatched errors are signaled, but notice this will happen at a
+Any uncaught errors are signaled, but notice this will happen at a
 later point in time."
   (prog1 nil
     (funcall athunk (lambda (err val) (when err (signal err val))))))
@@ -211,10 +211,10 @@ See `condition-case' for the exact meaning of VAR and HANDLERS."
                            (lambda (err val)
                              (if-let* ((next (pop (cdr state))))
                                  (run-with-timer 0 nil next)
-                               (cl-incf (car state)))
+                               (incf (car state)))
                              (funcall cont err val))))))
       (cond
-       ((> (car state) 0) (cl-decf (car state)) (funcall task))
+       ((> (car state) 0) (decf (car state)) (funcall task))
        (priority (push task (cdr state)))
        (t (nconc state (list task)))))))
 
@@ -244,7 +244,7 @@ athunk doesn't resolve immediately."
       (cond
        (reporter (progress-reporter-update reporter))
        (message (setq reporter (make-progress-reporter message))))
-      (cl-decf max-tries)
+      (decf max-tries)
       (sleep-for interval))
     (when err (signal err val))
     (unless done (error "athunk timed out"))
@@ -253,10 +253,13 @@ athunk doesn't resolve immediately."
 
 ;;; Customizable options
 
-(defgroup minimail nil
+(defgroup minimail '((auth-sources custom-variable)
+                     (mail-user-agent custom-variable)
+                     (message custom-group))
   "Simple, non-blocking IMAP email client."
   :prefix "minimail-"
-  :group 'mail)
+  :group 'mail
+  :link '(url-link :tag "website" "https://codeberg.org/astoff/minimail"))
 
 (cl-defun -custom-type-query-alist (&key key-type value-type allow-single value)
   (let* ((kt (pcase-exhaustive key-type
@@ -285,12 +288,12 @@ athunk doesn't resolve immediately."
                         (sexp :tag "Complex selector")))))
          (alist `(alist :key-type ,kt :value-type ,value-type)))
     (if allow-single
-        `(choice :tag "Scope"
-                 :value ,value
-                 ,value-type
-                 (alist :tag "Mailbox-specific values"
-                        :match ,(lambda (_ v) (consp v))
-                        ,@(cdr alist)))
+        `(radio :tag "Scope"
+                :value ,value
+                ,value-type
+                (alist :tag "Mailbox-specific values"
+                       :match ,(lambda (_ v) (consp v))
+                       ,@(cdr alist)))
       alist)))
 
 (defcustom minimail-reply-cite-original t
@@ -355,11 +358,20 @@ sorting by thread."
   "Maximum number of messages to fetch at a time when displaying a mailbox."
   :type 'natnum)
 
-(defcustom minimail-thread-style 'shallow
-  "How to display message threads."
+(defcustom minimail-thread-style nil
+  "How to display message threads.
+
+`hierarchical' shows a traditional thread tree.
+
+`shallow' organizes threads in flat listings ordered by date.  It uses
+server-side thread information when available, which may be more
+accurate.
+
+The value nil means to use `shallow' if server-side thread information
+is available, `hierarchical' otherwise."
   :type '(choice (const :tag "Shallow" shallow)
                  (const :tag "Hierarchical" hierarchical)
-                 (const :tag "Don't compute threads" nil)))
+                 (const :tag "Shallow if server-side threading available" nil)))
 
 (defcustom minimail-subject-faces '(((not \\Seen) . minimail-unseen)
                                     (t . vtable))
@@ -367,12 +379,17 @@ sorting by thread."
 This is used in `minimail-mailbox-mode' buffers."
   :type (-custom-type-query-alist :key-type 'flag :value-type 'face))
 
+(defgroup minimail-accounts
+  '((message-server-alist custom-variable))
+  "Minimail account settings."
+  :group 'minimail)
+
 (defcustom minimail-accounts
-  '((yhetil :incoming-url "imaps://:@yhetil.org/yhetil.emacs"
+  '((yhetil :incoming-url "imaps://;AUTH=ANONYMOUS@yhetil.org/yhetil.emacs"
             :thread-style hierarchical))
   "Account configuration for the Minimail client.
-This is an alist where keys are names used to refer to each account and
-values are a plist with the following information:
+This is an alist where each key is a symbol used to refer to an account
+and the corresponding value is a plist with the following information:
 
 :incoming-url
   Information about the IMAP server as a URL. Normally, it suffices to
@@ -381,18 +398,22 @@ values are a plist with the following information:
 
     imaps://<username>:<password>@<server-address>:<port>
 
-  If username is omitted, use the :mail-address property instead.
+  If the username contains special characters, they must be percent
+  encoded; in particular \"@\" must be entered as \"%40\".  If omitted,
+  the username is taken from the :mail-address property below.
 
-  If password is omitted (which is highly recommended), use the
-  auth-source mechanism. See Info node `(auth) Top' for details.
+  If the password is omitted (which is highly recommended), use the
+  auth-source mechanism.  See Info node `(auth) Help for users' for
+  details.
+
+  If your server requires STARTTLS connection instead of the default
+  TLS, use \"imap\" as URL scheme.
 
 :mail-address
-  The email address of this account.  Overrides the global value of
-  `user-mail-address'.
-
-:full-name
-  Name used in the To field of messages you compose.  Overrides the
-  global value of `user-full-name'.
+  The address used to compose messages.  Can be either a plain email
+  address or in the form \"Fulano de Tal <user@example.net>\".
+  Overrides the global values of `user-mail-address' and, optionally,
+  `user-full-name'.
 
 :signature
   Message signature, as value accepted by `message-signature' or,
@@ -428,9 +449,6 @@ possible, see `minimail--key-match-p'."
      :options
      ((:incoming-url string)
       (:mail-address    ,(-custom-type-query-alist
-                          :allow-single t :value ""
-                          :key-type 'mailbox :value-type 'string))
-      (:full-name       ,(-custom-type-query-alist
                           :allow-single t :value ""
                           :key-type 'mailbox :value-type 'string))
       (:signature       ,(-custom-type-query-alist
@@ -560,7 +578,7 @@ possible, see `minimail--key-match-p'."
 (define-icon minimail-message-important nil
   '((emoji "🔸") (symbol "⬥") (text "i"))
   "Icon for important messages."
-  :help-echo "Important"
+  :help-echo "Automatically flagged as important"
   :version "0.3")
 
 (define-icon minimail-message-answered nil
@@ -640,8 +658,6 @@ mailbox, or nil when the connection is in unselected state.")
 
 (defvar -message-rendering-function #'-gnus-render-message
   "Function used to render a message buffer for display.")
-
-(define-error '-imap-error "error in IMAP response")
 
 (defun -get-data (string)
   "Get data stored as a string property in STRING."
@@ -754,7 +770,6 @@ cell (ACCOUNT . MAILBOX-NAME).  We then proceed as follows:
       (symbol-value
        (alist-get keyword
                   '((:fetch-limit . minimail-fetch-limit)
-                    (:full-name . user-full-name)
                     ;; Unlike other keywords, we care to distinguish
                     ;; when this one is explicitly set
                     ;; (:mail-address . user-mail-address)
@@ -801,6 +816,14 @@ MAILBOX-NAME in it."
            `(":" (:propertize "Error"
                               help-echo ,(format "%s: %s" error data)
                               face minimail-mode-line-error))))))
+
+(defun -split-mail-address (address)
+  (if (string-match "\\(.*\\)<\\(.*\\)>" address)
+      (let ((addr (match-string 2 address))
+            (name (string-trim (match-string 1 address))))
+        (cons addr (unless (string-empty-p name) name)))
+    (list address)))
+
 ;;;; vtable tricks
 
 (defun -vtable-ensure-table ()
@@ -812,17 +835,24 @@ But first move point inside table if near the end of buffer."
            (vtable-current-table))
       (user-error "No table found")))
 
-(defun -vtable-find-object (pred &optional below)
+(defun -vtable-find-object (pred &optional direction)
   "Go to the first object satisfying PRED in the current table.
-Return the object, or nil if not found.
-If BELOW is non-nil, only search starting from the current position."
-  (let ((start (point)))
-    (unless below (vtable-beginning-of-table))
-    (while (when-let* ((obj (vtable-current-object)))
-             (not (funcall pred obj)))
-      (forward-line))
-    (or (vtable-current-object)
-        (prog1 nil (goto-char start)))))
+If found, move point and return the object; else, just return nil.
+
+If DIRECTION is ±1, only search below/above starting from the current
+position."
+  (let ((start (point)) obj)
+    (unless direction
+      (vtable-beginning-of-table)
+      (setq direction +1))
+    (cl-assert (memq direction '(+1 -1)))
+    (catch 'done
+      (setq obj (vtable-current-object))
+      (while obj
+        (when (funcall pred obj) (throw 'done obj))
+        (setq obj (when (zerop (forward-line direction))
+                    (vtable-current-object))))
+      (prog1 nil (goto-char start)))))
 
 (defvar -vtable-before-sort-by-current-column-hook nil)
 (advice-add #'vtable-sort-by-current-column :before
@@ -830,179 +860,14 @@ If BELOW is non-nil, only search starting from the current position."
               (run-hooks '-vtable-before-sort-by-current-column-hook))
             '((name . -vtable-before-sort-by-current-column-hook)))
 
-;;; Low-level IMAP communication
+;;; IMAP
 
 ;; References:
 ;; - IMAP4rev1: https://datatracker.ietf.org/doc/html/rfc3501
 ;; - IMAP4rev2: https://datatracker.ietf.org/doc/html/rfc9051
 ;; - IMAP URL syntax: https://datatracker.ietf.org/doc/html/rfc5092
 
-(defvar-local -imap-callbacks nil)
-(defvar-local -imap-command-queue nil)
-(defvar-local -imap-idle-timer nil)
-(defvar-local -imap-last-tag nil)
-
-(defun -imap-connect (account)
-  "Return a network stream connected to ACCOUNT."
-  (let* ((props (or (alist-get account minimail-accounts)
-                    (error "Invalid account: %s" account)))
-         (url (url-generic-parse-url (plist-get props :incoming-url)))
-         (stream-type (pcase (url-type url)
-                        ("imaps" 'tls)
-                        ("imap" 'starttls)
-                        (other (user-error "\
-In `minimail-accounts', incoming-url must have imaps or imap scheme, got %s" other))))
-         (user (or (when (url-user url)
-                      (url-unhex-string (url-user url)))
-                   (-settings-scalar-get :mail-address account)
-                   (user-error "No username found for account %s" account)))
-         (pass (or (url-password url)
-                   (let ((enable-recursive-minibuffers t))
-                     (auth-source-pick-first-password
-                      :user user
-                      :host (url-host url)
-                      :port (url-portspec url)
-                      ;; TODO: Offer to save, if authentication successful.
-                      :create t))
-                   (error "No password found for account %s" account)))
-         (buffer (generate-new-buffer (format " *minimail-%s*" account)))
-         (proc (open-network-stream
-                (format "minimail-%s" account)
-                buffer
-                (url-host url)
-                (or (url-portspec url)
-                    (pcase stream-type
-                      ('tls 993)
-                      ('starttls 143)))
-                :type stream-type
-                :coding 'binary
-                :nowait t)))
-    (set-process-filter proc #'-imap-process-filter)
-    (set-process-sentinel proc #'-imap-process-sentinel)
-    (set-process-query-on-exit-flag proc nil)
-    (with-current-buffer buffer
-      (set-buffer-multibyte nil)
-      (setq -imap-last-tag 0)
-      (setq -imap-idle-timer (run-with-timer
-                              minimail-connection-idle-timeout nil
-                              #'delete-process proc)))
-    (-imap-enqueue
-     proc nil
-     (cond
-      ;; TODO: use ;AUTH=... notation as in RFC 5092?
-      ((string-empty-p user) "AUTHENTICATE ANONYMOUS\r\n")
-      (t (format "AUTHENTICATE PLAIN %s"
-                 (base64-encode-string (format "\0%s\0%s"
-                                               user pass)))))
-     (lambda (status message)
-       (unless (eq status 'ok)
-         (lwarn 'minimail :error "IMAP authentication error (%s):\n%s"
-                account message))))
-    proc))
-
-(defun -imap-process-sentinel (proc message)
-  (-log-message "sentinel: %s %s" proc (process-status proc))
-  (pcase (process-status proc)
-    ('open
-     (with-current-buffer (process-buffer proc)
-       (when-let* ((queued (pop -imap-command-queue)))
-         (apply #'-imap-send proc queued))))
-    ((or 'closed 'failed)
-     (with-current-buffer (process-buffer proc)
-       (pcase-dolist (`(_ _ . ,cb) -imap-callbacks)
-         (funcall cb 'error message)))
-     (kill-buffer (process-buffer proc)))))
-
-(defun -imap-process-filter (proc string)
-  (with-current-buffer (process-buffer proc)
-    (timer-set-time -imap-idle-timer
-                    (time-add nil minimail-connection-idle-timeout))
-    (save-excursion
-      (goto-char (point-max))
-      (insert string))
-    (cond
-     ;; Case 1: we are in the process of receiving an IMAP literal
-     ;; string.  Keep point at the beginning of the literal string to
-     ;; check again next time if it's complete.  If this test fails,
-     ;; then as a side effect we skip over any complete literal
-     ;; strings that may be present in the buffer.
-     ((catch 'done
-        (while (re-search-forward "{\\([0-9]+\\)}\r\n" nil t)
-          (let ((end (+ (point) (string-to-number (match-string 1)))))
-            (if (<= end (point-max))
-                (goto-char end)
-              (goto-char (match-beginning 0))
-              (throw 'done t))))))
-     ;; Case 2: we find a tagged response.  Call the respective
-     ;; callback and send the next command, if there is one in the
-     ;; queue.
-     ((re-search-forward (rx bol
-                             ?T (group (+ digit))
-                             ?\s (group (+ alpha))
-                             ?\s (group (* (not control)))
-                             (? ?\r) ?\n)
-                         nil t)
-      (pcase-let* ((cont (copy-marker (match-end 0)))
-                   (tag (string-to-number (match-string 1)))
-                   (status (intern (downcase (match-string 2))))
-                   (message (match-string 3))
-                   (`(,mailbox . ,callback) (alist-get tag -imap-callbacks)))
-        (setf (alist-get tag -imap-callbacks nil t) nil)
-        (-log-message "response: %s %s\n%s"
-                      proc
-                      (or -current-mailbox "(unselected)")
-                      (buffer-string))
-        (unwind-protect
-            (progn
-              (cl-assert (equal mailbox (and mailbox -current-mailbox)) t)
-              (with-restriction (point-min) cont
-                (goto-char (point-min))
-                (funcall callback status message)))
-          (delete-region (point-min) cont)
-          (when-let* ((queued (pop -imap-command-queue)))
-            (apply #'-imap-send proc queued)))))
-     ;; Case 3: no tagged response yet.  Look for one again when more
-     ;; data arrives.
-     (t (goto-char (point-max))
-        (goto-char (pos-bol))))))
-
-(defun -imap-send (proc tag mailbox command)
-  "Execute an IMAP COMMAND (provided as a string) in network stream PROC.
-TAG is an IMAP tag for the command.
-Ensure the given MAILBOX is selected before issuing the command, unless
-it is nil."
-  (if (or (not mailbox)
-          (equal mailbox -current-mailbox))
-      (process-send-string proc (format "T%s %s\r\n" tag command))
-    ;; Need to select a different mailbox
-    (let ((newtag (cl-incf -imap-last-tag))
-          (cont (lambda (status message)
-                  (if (eq 'ok status)
-                      (progn
-                        (setq -current-mailbox mailbox)
-                        ;; Trick: this will cause the process filter
-                        ;; to call `-imap-send' with the original
-                        ;; command next.
-                        (push (list tag mailbox command) -imap-command-queue))
-                    (let ((callback (alist-get tag -imap-callbacks)))
-                      (setf (alist-get tag -imap-callbacks nil t) nil)
-                      (funcall callback status message))))))
-      (push `(,newtag nil . ,cont) -imap-callbacks)
-      (process-send-string proc (format "T%s SELECT %s\r\n"
-                                        newtag (-imap-quote mailbox))))))
-
-(defun -imap-enqueue (proc mailbox command callback)
-  (with-current-buffer (process-buffer proc)
-    (let ((tag (cl-incf -imap-last-tag)))
-      (if (or -imap-callbacks
-              ;; Sending to process in `connect' state blocks Emacs,
-              ;; so delay it
-              (not (eq 'open (process-status proc))))
-          (cl-callf nconc -imap-command-queue `((,tag ,mailbox ,command)))
-        (-imap-send proc tag mailbox command))
-      (push `(,tag ,mailbox . ,callback) -imap-callbacks))))
-
-;;; IMAP parsing
+;;;; IMAP parsing
 
 ;; References:
 ;; - Formal syntax: https://datatracker.ietf.org/doc/html/rfc3501#section-9
@@ -1045,10 +910,10 @@ contain quoted strings with non-ASCII characters."
 
 (define-peg-ruleset -imap-peg-rules
   (sp        () (char ?\s))
-  (dquote   ()  (char ?\"))
+  (dquote    ()  (char ?\"))
   (crlf      () "\r\n")
   (anil      () "NIL" `(-- nil))
-  (tagged    () (bol) (char ?T) (+ [0-9]) sp) ;we always format our tags as T<number>
+  (tagged    () (bol) (+ [0-9]) sp) ;we always format our tags as a number
   (untagged  () (bol) "* ")
   (number    () (substring (+ [0-9])) `(s -- (string-to-number s)))
   (achar     () (and (not [cntrl "(){] %*\"\\"]) (any))) ;characters allowed in an atom
@@ -1159,27 +1024,17 @@ contain quoted strings with non-ASCII characters."
 (defun -parse-fetch ()
   (with-peg-rules
       (-imap-peg-rules
-       (address "("
-                (list (and nqpstring `(s -- `(name . ,s)))
-                      sp (and nstring `(_ --)) ;discard useless addr-adl field
-                      sp (and nstring `(s -- `(mailbox . ,s)))
-                      sp (and nstring `(s -- `(host . ,s))))
-                ")")
-       (addresses (or anil
-                      (and "(" (list (* address)) ")")))
+       (address "(" nqpstring sp nstring sp nstring sp nstring ")"
+                `(name adl mailbox host -- (vector name adl mailbox host)))
+       (addresses (or anil (and "(" (list (* address)) ")")))
        (envelope "ENVELOPE ("
-                 (list nstring `(s -- `(date . ,(when s (parse-time-string s))))
-                       sp nqpstring `(s -- `(subject . ,s))
-                       sp addresses `(v -- `(from . ,v))
-                       sp addresses `(v -- `(sender . ,v))
-                       sp addresses `(v -- `(reply-to . ,v))
-                       sp addresses `(v -- `(to . ,v))
-                       sp addresses `(v -- `(cc . ,v))
-                       sp addresses `(v -- `(bcc . ,v))
-                       sp nstring `(v -- `(in-reply-to . ,v))
-                       sp nstring `(v -- `(message-id . ,v)))
+                 nstring sp nqpstring sp addresses sp addresses sp addresses
+                 sp addresses sp addresses sp addresses sp nstring sp nstring
                  ")"
-                 `(s -- `(envelope . ,s)))
+                 `( date subject from sender reply-to
+                    to cc bcc in-reply-to message-id
+                    -- `(envelope . ,(vector date subject from sender reply-to
+                                             to cc bcc in-reply-to message-id))))
        (body-param (or anil
                        (list "("
                              (+ (opt sp) qstring sp qstring
@@ -1226,12 +1081,23 @@ contain quoted strings with non-ASCII characters."
     (car-safe
      (peg-run (peg (list (* (list item))))))))
 
-;; Helpers to access message information alists from the FETCH command
-(defsubst -message-id (msg) (let-alist msg .id))
-(defsubst -message-uid (msg) (let-alist msg .uid))
-(defsubst -message-flags (msg) (let-alist msg .flags))
-(defsubst -message-envelope (msg) (let-alist msg .envelope))
-(defsubst -message-subject (msg) (let-alist msg .envelope.subject))
+;; Helpers to access message information from the FETCH command
+(defsubst -address-name    (addr) (elt addr 0))
+(defsubst -address-mailbox (addr) (elt addr 2))
+(defsubst -address-host    (addr) (elt addr 3))
+
+(defsubst -message-id          (msg) (let-alist msg .id))
+(defsubst -message-uid         (msg) (let-alist msg .uid))
+(defsubst -message-flags       (msg) (let-alist msg .flags))
+(defsubst -message-date        (msg) (elt (let-alist msg .envelope) 0))
+(defsubst -message-subject     (msg) (elt (let-alist msg .envelope) 1))
+(defsubst -message-from        (msg) (elt (let-alist msg .envelope) 2))
+(defsubst -message-reply-to    (msg) (elt (let-alist msg .envelope) 4))
+(defsubst -message-to          (msg) (elt (let-alist msg .envelope) 5))
+(defsubst -message-cc          (msg) (elt (let-alist msg .envelope) 6))
+(defsubst -message-bcc         (msg) (elt (let-alist msg .envelope) 7))
+(defsubst -message-in-reply-to (msg) (elt (let-alist msg .envelope) 8))
+(defsubst -message-message-id  (msg) (elt (let-alist msg .envelope) 9))
 
 (defun -parse-search ()
   (with-peg-rules
@@ -1248,38 +1114,253 @@ contain quoted strings with non-ASCII characters."
     (car-safe
      (peg-run (peg untagged (or esearch search) crlf)))))
 
-;;; Async IMAP requests
+;;;; IMAP network process
+
+(define-error '-imap-error "IMAP error")
+(define-error '-imap-response-no "IMAP NO response" '-imap-error)
+(define-error '-imap-response-bad "IMAP BAD response" '-imap-error)
+
+(defvar-local -imap-callbacks nil)
+(defvar-local -imap-idle-timer nil)
+(defvar-local -imap-last-tag nil)
+
+(defun -imap-connect (name host port type callback)
+  "Return a network stream connected to an IMAP server.
+NAME, HOST, PORT and TYPE are as in `open-network-stream'.
+
+CALLBACK is called with two arguments, nil and the network process, when
+the connection is finally open.  Note that sending data to the process
+before that, while possible, blocks Emacs."
+  (let* ((buffer (generate-new-buffer (format " *%s*" name)))
+         (proc (open-network-stream
+                name buffer host port
+                :type type
+                :coding 'binary
+                :nowait t)))
+    (set-process-filter proc #'-imap-process-filter)
+    (set-process-sentinel proc #'-imap-process-sentinel)
+    (set-process-query-on-exit-flag proc nil)
+    (with-current-buffer buffer
+      (set-buffer-multibyte nil)
+      (setq -imap-last-tag 0)
+      (setq -imap-callbacks `((0 . ,callback)))
+      (setq -imap-idle-timer (run-with-timer
+                              minimail-connection-idle-timeout nil
+                              #'delete-process proc)))
+    proc))
+
+(defun -imap-process-sentinel (proc message)
+  "Sentinel for IMAP processes."
+  (-log-message "sentinel: %s %s" proc (process-status proc))
+  (pcase (process-status proc)
+    ('open
+     (with-current-buffer (process-buffer proc)
+       (let ((callback (alist-get 0 -imap-callbacks)))
+         (setf (alist-get 0 -imap-callbacks nil t) nil)
+         (funcall callback nil proc))))
+    ((or 'closed 'failed)
+     (with-current-buffer (process-buffer proc)
+       (pcase-dolist (`(_ . ,callback) -imap-callbacks)
+         (funcall callback 'error message)))
+     (kill-buffer (process-buffer proc)))))
+
+(defun -imap-process-filter (proc string)
+  "Filter function for IMAP processes."
+  (with-current-buffer (process-buffer proc)
+    (timer-set-time -imap-idle-timer
+                    (time-add nil minimail-connection-idle-timeout))
+    (save-excursion
+      (goto-char (point-max))
+      (insert string))
+    (cond
+     ;; Case 1: we are in the process of receiving an IMAP literal
+     ;; string.  Keep point at the beginning of the literal string to
+     ;; check again next time if it's complete.  If this test fails,
+     ;; then as a side effect we skip over any complete literal
+     ;; strings that may be present in the buffer.
+     ((catch 'done
+        (while (re-search-forward (rx "{" (group (+ digit)) "}\r\n") nil t)
+          (let ((end (+ (point) (string-to-number (match-string 1)))))
+            (if (<= end (point-max))
+                (goto-char end)
+              (goto-char (match-beginning 0))
+              (throw 'done t))))))
+     ;; Case 2: we find a tagged response so we call the respective
+     ;; callback.
+     ((re-search-forward (rx bol (group (+ digit))
+                             ?\s (group (+ alpha))
+                             ?\s (group (* (not control)))
+                             (? ?\r) ?\n)
+                         nil t)
+      (let* ((tag (string-to-number (match-string 1)))
+             (error (pcase (upcase (match-string 2))
+                      ("NO" '-imap-response-no)
+                      ("BAD" '-imap-response-bad)))
+             (message (match-string 3))
+             (callback (alist-get tag -imap-callbacks)))
+        (-log-message "response: %s %s\n%s"
+                      proc
+                      (or -current-mailbox "(unselected)")
+                      (buffer-string))
+        (setf (alist-get tag -imap-callbacks nil t) nil)
+        (with-restriction (point-min) (point)
+          (unwind-protect
+              (funcall callback error message)
+            (delete-region (point-min) (point-max))))))
+     ;; Case 3: no tagged response yet.  Look for one again when more
+     ;; data arrives.
+     (t (goto-char (point-max))
+        (goto-char (pos-bol))))))
+
+(defun -imap-send-command (proc command callback)
+  "Send COMMAND to IMAP process PROC.
+When a response arrives, CALLBACK is called, on a buffer containing the
+server response, with two arguments: an error symbol and a message."
+  (with-current-buffer (process-buffer proc)
+    (let ((tag (incf -imap-last-tag)))
+      (-log-message "request: %s %s\n%s"
+                    proc
+                    (or -current-mailbox "(unselected)")
+                    command)
+      (process-send-string proc (format "%s %s\r\n" tag command))
+      (push (cons tag callback) -imap-callbacks))))
+
+;;;; Async IMAP requests
+
+(defun -asend-command (proc command)
+  "Athunk to send COMMAND to IMAP process PROC.
+For an OK response, this yields a temporary a buffer containing the
+server response.  The buffer is automatically cleaned up after use.
+For a NO or BAD response or a network error, signals an error."
+  (lambda (cont)
+    (-imap-send-command
+     proc command
+     (lambda (error message)
+       (if error
+           (funcall cont error message)
+         (let ((buffer (current-buffer))
+               (tmpbuf (generate-new-buffer " *minimail-temp*")))
+           (with-current-buffer tmpbuf
+             (set-buffer-multibyte nil)
+             (insert-buffer-substring buffer)
+             (goto-char (point-min)))
+           (run-with-timer 0 nil (lambda ()
+                                   (unwind-protect
+                                       (funcall cont nil tmpbuf)
+                                     (kill-buffer tmpbuf))))))))))
+
+(defun -amake-process (account)
+  "Athunk yielding a new, authenticated IMAP process for ACCOUNT."
+  (athunk-let*
+      ((props (or (alist-get account minimail-accounts)
+                  (error "Invalid account: %s" account)))
+       (url (url-generic-parse-url (plist-get props :incoming-url)))
+       (type (pcase-exhaustive (url-type url)
+               ("imaps" 'tls)
+               ("imap" 'starttls)))
+       ;; If URL has no username, guess it from the :mail-address
+       ;; account property.
+       (user (or (when (url-user url)
+                   (url-unhex-string (url-user url)))
+                 (when-let* ((addr (-settings-scalar-get :mail-address account)))
+                   (car (-split-mail-address addr)))
+                 (user-error "No username found for account %s" account)))
+       ;; AUTH=<mechanism> notation as in RFC 5092.  If found, strip
+       ;; it out of the username.  If nothing found here, we also look
+       ;; at the :smtp-auth property of the auth-info entry (which
+       ;; they should have called :sasl-mechanism, as it applies to
+       ;; other protocols).
+       (mech (and (url-user url)
+                  (string-match (rx ";AUTH=" (group (+ alnum)) eos) user)
+                  (prog1 (intern (downcase (match-string 1 user)))
+                    (setq user (substring user 0 (match-beginning 0))))))
+       (auth (cond
+              ((eq mech 'anonymous) nil)
+              ((url-password url)
+               `(:secret ,(url-password url)))
+              ((let ((enable-recursive-minibuffers t))
+                 (car (auth-source-search
+                       :user user
+                       :host (url-host url)
+                       :port (url-portspec url)
+                       :max 1 :create t))))
+              ((error "No password found for account %s" account))))
+       (secret <- (if (plist-get auth :async)
+                      (lambda (cont) (funcall (plist-get auth :secret) cont))
+                    (athunk-wrap (auth-info-password auth))))
+       (proc <- (lambda (cont)
+                  (-imap-connect (format "minimail-%s" account)
+                                 (url-host url)
+                                 (or (url-portspec url)
+                                     (pcase type
+                                       ('tls 993)
+                                       ('starttls 143)))
+                                 type
+                                 cont)))
+       (cmd (seq-some
+             (lambda (mech)
+               (pcase mech
+                 ('anonymous            ;RFC 2245
+                  (format "AUTHENTICATE ANONYMOUS\r\n%s"
+                          (base64-encode-string user t)))
+                 ('oauthbearer          ;RFC 7628
+                  (format "AUTHENTICATE OAUTHBEARER %s"
+                          (base64-encode-string
+                           (format "n,a=%s,\1auth= Bearer %s\1\1" user secret) t)))
+                 ('xoauth2              ;de facto standard
+                  (format "AUTHENTICATE XOAUTH2 %s"
+                          (base64-encode-string
+                           (format "user=%s\1auth= Bearer %s\1\1" user secret) t)))
+                 ('plain
+                  (format "AUTHENTICATE PLAIN %s"
+                          (base64-encode-string
+                           (format "\0%s\0%s" user secret) t)))))
+             (ensure-list (or mech (plist-get auth :smtp-auth) 'plain))))
+       (_ <- (athunk-condition-case err
+                 (-asend-command proc cmd)
+               (-imap-error
+                (lwarn 'minimail :error "IMAP authentication error (%s):\n%S"
+                       account (caddr err))
+                (signal (car err) (cdr err))))))
+    (when (plist-get auth :save-function)
+      (let ((enable-recursive-minibuffers t))
+        (funcall (plist-get auth :save-function))))
+    proc))
+
+(defvar -amake-request nil
+  "Synchronization data for the function of same name.")
 
 (defun -amake-request (account-or-mailbox command)
-  "Issue COMMAND to the IMAP server, ensuring the right mailbox is selected.
+  "Issue COMMAND to the IMAP server.
 ACCOUNT-OR-MAILBOX can be a cons cell (ACCOUNT . MAILBOX-NAME) or just
 an account name as a symbol.
 
-Returns an athunk which resolves to a temporary buffer containing the
-server response.  The temporary buffer is cleaned up automatically after
-being used."
-  (lambda (cont)
-    (let* ((account (or (car-safe account-or-mailbox) account-or-mailbox))
-           (proc (alist-get 'process (alist-get account -account-state))))
-      (unless (process-live-p proc)
-        (setq proc (-imap-connect account))
-        (setf (alist-get 'process (alist-get account -account-state)) proc))
-      (-imap-enqueue
-       proc (cdr-safe account-or-mailbox) command
-       (lambda (status message)
-         (if (not (eq 'ok status))
-             (funcall cont '-imap-error (list status message))
-           (let* ((buffer (current-buffer))
-                  (tmpbuf (generate-new-buffer " *minimail-temp*"))
-                  (continue (lambda ()
-                              (unwind-protect
-                                  (funcall cont nil tmpbuf)
-                                (kill-buffer tmpbuf)))))
-             (with-current-buffer tmpbuf
-               (set-buffer-multibyte nil)
-               (insert-buffer-substring buffer)
-               (goto-char (point-min)))
-             (run-with-timer 0 nil continue))))))))
+This yields the same result as `minimail--asend-command', but takes care
+of picking an existing connection process or starting a new one, and
+ensures that MAILBOX-NAME, if given, is selected."
+  (let ((account (or (car-safe account-or-mailbox) account-or-mailbox))
+        (mailbox (cdr-safe account-or-mailbox)))
+    (athunk-with-semaphore (alist-get account -amake-request)
+      (athunk-let*
+          ((oldproc (alist-get 'process (alist-get account -account-state)))
+           (proc <- (if (process-live-p oldproc)
+                        (athunk-wrap oldproc)
+                      (-amake-process account)))
+           (_ (setf (alist-get 'process (alist-get account -account-state))
+                    proc))
+           (select <- (if (or (not mailbox)
+                              (equal mailbox (buffer-local-value
+                                              '-current-mailbox
+                                              (process-buffer proc))))
+                          (athunk-wrap nil)
+                        (-asend-command proc (format "SELECT %s"
+                                                     (-imap-quote mailbox)))))
+           (_ (when select
+                (setf (buffer-local-value '-current-mailbox
+                                          (process-buffer proc))
+                      mailbox)))
+           (buffer <- (-asend-command proc command)))
+        buffer))))
 
 (defun -aget-capability (account)
   (athunk-let*
@@ -1531,7 +1612,7 @@ If MAILBOX-BUFFER is non-nil, updating the UI when done."
                          (get-buffer-window msgbuf)))
               (next (-vtable-find-object
                      (lambda (m) (not (memq (-message-uid m) set)))
-                     t)))
+                     +1)))
           (-mailbox-buffer-update messages)
           (unless next
             ;; Above, we tried to move point to the next message not
@@ -1569,7 +1650,7 @@ or a string containing such an alist as a property."
   (let-alist (if (stringp mbinfo) (car (-get-data mbinfo)) mbinfo)
     (when .messages
       (let ((suffix (if (eq 1 .messages) "" "s")))
-        (if (cl-plusp .unseen)
+        (if (plusp .unseen)
             (format " %s message%s, %s unseen" .messages suffix .unseen)
           (format " %s message%s" .messages suffix))))))
 
@@ -1635,7 +1716,7 @@ Return a cons cell consisting of the account symbol and mailbox name."
 Can be called in a mailbox or in a message buffer."
   (cond
    ((derived-mode-p 'minimail-message-mode)
-    (list (alist-get 'uid -local-state)))
+    (list (alist-get 'uid (car -message-list))))
    ((derived-mode-p 'minimail-mailbox-mode)
     (if (use-region-p)
         ;; TODO: Ideally we would use a dired-style marking
@@ -1699,8 +1780,7 @@ as a string."
           (format "%s %S" tag value))
          ((or 'before 'on 'since 'sentbefore 'senton 'sentsince) ;date argument
           (pcase-let ((`(,day ,month ,year) (drop 3 (parse-time-string value))))
-            (format "%s %s-%s-%s" tag day (aref -imap-months (1- month)) year)))
-         ('raw (-get-data value)))))
+            (format "%s %s-%s-%s" tag day (aref -imap-months (1- month)) year))))))
    items " "))
 
 (transient-define-prefix -search-transient ()
@@ -1728,13 +1808,13 @@ as a string."
     ("c" "CC"  :cons 'cc :class -transient-search-option
      :prompt "Messages with copy to: ")]
    ["When"
-    ("d" "Date" :cons 'date :class -transient-search-option
+    ("d" "Date" :cons 'senton :class -transient-search-option
      :prompt "Messages dated exactly: "
      :reader transient-read-date)
-    ("<" "Before" :cons 'before :class -transient-search-option
+    ("<" "Before" :cons 'sentbefore :class -transient-search-option
      :prompt "Messages dated before: "
      :reader transient-read-date)
-    (">" "Since" :cons 'since :class -transient-search-option
+    (">" "Since" :cons 'sentsince :class -transient-search-option
      :prompt "Messages dated after: "
      :reader transient-read-date)]
    ["What"
@@ -1742,7 +1822,7 @@ as a string."
      :prompt "Messages with subject containing: ")
     ("b" "Body" :cons 'body :class -transient-search-option
      :prompt "Messages with body containing: ")
-    ("z" "Size" :cons 'raw :class -transient-search-option
+    ("z" "Size" :cons nil :class -transient-search-option
      :prompt "\
 Enter a number, optionally preceded by < or > and suffixed with a multiplier.
 Messages with size (bytes): "
@@ -1754,13 +1834,13 @@ Messages with size (bytes): "
                                  (* space) (group (? (any "kKmM"))))
                              input)
            (let ((comp (pcase (match-string 1 input)
-                         ("<" '("≤ " . "SMALLER %s"))
-                         ((or ">" "") '("≥ " . "LARGER %s"))))
+                         ("<" '("≤ " . smaller))
+                         ((or ">" "") '("≥ " . larger))))
                  (n (* (string-to-number (match-string 2 input))
                        (pcase (downcase (match-string 3 input))
                          ("k" 1024) ("m" 1048576) (_ 1)))))
              (propertize (concat (car comp) (file-size-human-readable n))
-                         'minimail (format (cdr comp) n)))))))]
+                         'minimail (cons (cdr comp) n)))))))]
    ["Flags"
     ("." "Seen" :cons 'seen :class -transient-search-switch)
     ("!" "Flagged" :cons 'flagged :class -transient-search-switch)
@@ -1768,10 +1848,19 @@ Messages with size (bytes): "
   [[("RET" "Search"
      (lambda (arg)
        (interactive "P")
-       (pcase-let* ((`((mailbox . ,mb) . ,items)
-                     (transient-args transient-current-command))
-                    (mailbox (or (-get-data mb) (error "No mailbox")))
-                    (query (-format-search items)))
+       (let* ((items (transient-args transient-current-command))
+              (mailbox (or (-get-data (alist-get 'mailbox items))
+                           (error "No mailbox")))
+              (query (-format-search
+                      ;; Drop mailbox entry, replace (nil . STRING)
+                      ;; entries by the (CLAUSE . ARGUMENT) sneaked
+                      ;; into the string.
+                      (mapcan (lambda (it)
+                                (pcase (car it)
+                                  ('mailbox nil)
+                                  ('nil (list (-get-data (cdr it))))
+                                  (_ (list it))))
+                              items))))
          (when arg
            (setq query (read-from-minibuffer "IMAP search: " query)))
          (minimail-search mailbox query))))]])
@@ -1908,7 +1997,9 @@ current message."
   "DEL" #'minimail-message-scroll-down
   "S-SPC" #'minimail-message-scroll-down
   "n" #'minimail-next-message
+  "N" #'minimail-next-message-unseen
   "p" #'minimail-previous-message
+  "P" #'minimail-previous-message-unseen
   "r" #'minimail-reply
   "R" #'minimail-reply-all
   "f" #'minimail-forward
@@ -1922,6 +2013,15 @@ current message."
   "!" #'minimail-toggle-message-flagged
   "." #'minimail-toggle-message-seen
   "c" #'compose-mail)
+
+(defvar -base-menu
+  '(["Search Messages" minimail-search
+     :help "Search for messages in this mailbox"]
+    ["Compose New Message" compose-mail
+     :help "Start writing a new mail message"]
+    "---"
+    ["Configure Accounts" (customize-group 'minimail-accounts)]
+    ["Customize Minimail"  (customize-group 'minimail)]))
 
 (defvar-keymap minimail-mailbox-mode-map
   :parent (make-composed-keymap (list minimail-base-keymap vtable-map)
@@ -1952,10 +2052,7 @@ current message."
      ["Descending" (minimail-sort-by-thread 'descend)
       :style radio :selected (eq -sort-by-thread 'descend)
       :help "Most relevant threads towards the bottom of the buffer"])
-    ["Search Messages" minimail-search
-     :help "Search for messages in this mailbox"]
-    ["Compose New Message" compose-mail
-     :help "Start writing a new mail message"]))
+    ,@-base-menu))
 
 (defun -message-context-menu (menu &optional click)
   "Context menu for messages.
@@ -2031,7 +2128,7 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
                       (reverse (-thread-ancestors message)))))
     (concat
      ;; Indicate an incomplete thread
-     (when (alist-get 'in-reply-to (-message-envelope (car ancestors)))
+     (when (-message-in-reply-to (car ancestors))
        (when (eq (car ancestors) message)
          (icon-string 'minimail-thread-false-root)))
      ;; Thread tree prefix
@@ -2063,22 +2160,21 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
   (propertize
    (mapconcat
     (lambda (addr)
-      (let-alist addr
-        (or .name .mailbox "(unknown)")))
+      (or (-address-name addr) (-address-mailbox addr) "(unknown)"))
     addresses
     ", ")
    'help-echo
    (lambda (&rest _)
      (mapconcat
       (lambda (addr)
-        (let-alist addr
-          (mail-header-make-address .name (concat .mailbox "@" .host))))
+        (mail-header-make-address
+         (-address-name addr)
+         (concat (-address-mailbox addr) "@" (-address-host addr))))
       addresses
       "\n"))))
 
-(defun -format-date (date)
+(defun -format-date (timestamp)
   (let* ((current-time-list nil)
-         (timestamp (condition-case nil (encode-time date) (t 0)))
          (today (let ((v (decode-time)))
                   (setf (decoded-time-hour v) 0)
                   (setf (decoded-time-minute v) 0)
@@ -2087,6 +2183,7 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
          ;; Message age in seconds since start of this day
          (age (- (encode-time today) timestamp))
          (fmt (cond
+               ((zerop timestamp) "")
                ((<= age (- (* 24 60 60))) "%Y %b %d")
                ((<= age 0) "%R")
                ((<= age (* 6 24 60 60)) "%a %R")
@@ -2103,7 +2200,7 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
   "The MESSAGE envelope date as a Unix timestamp."
     (let ((current-time-list nil))
       (condition-case nil
-          (encode-time (alist-get 'date (-message-envelope message)))
+          (encode-time (parse-time-string (-message-date message)))
         (t 0))))
 
 (defvar minimail-mailbox-mode-column-alist
@@ -2147,19 +2244,18 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
     (from
      :name "From"
      :max-width 30
-     :getter ,(lambda (msg _)
-                (-format-names (alist-get 'from (-message-envelope msg)))))
+     :getter ,(lambda (msg _) (-format-names (-message-from msg))))
     (to
      :name "To"
      :max-width 30
-     :getter ,(lambda (msg _)
-                (-format-names (alist-get 'to (-message-envelope msg)))))
+     :getter ,(lambda (msg _) (-format-names (-message-to msg))))
     (recipients
      :name "Recipients"
      :max-width 30
      :getter ,(lambda (msg _)
-                (let-alist (-message-envelope msg)
-                  (-format-names (append .to .cc .bcc)))))
+                (-format-names (append (-message-to msg)
+                                       (-message-cc msg)
+                                       (-message-bcc msg)))))
     (subject
      :name "Subject"
      :max-width 80
@@ -2171,14 +2267,9 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
     (date
      :name "Date"
      :width 12
-     :getter ,(lambda (msg _)
-                ;; The envelope date as Unix timestamp, formatted as a
-                ;; hex string.  This ensures the correct sorting.
-                (propertize (format "%09x" (-message-timestamp msg))
-                            'minimail (alist-get 'date (-message-envelope msg))))
-     :formatter ,(lambda (s)
-                   (propertize (-format-date (-get-data s))
-                               'face 'vtable)))
+     :align left
+     :getter ,(lambda (msg _) (-message-timestamp msg))
+     :formatter -format-date)
     (size
      :name "Size"
      :getter ,(lambda (msg _) (alist-get 'rfc822-size msg))
@@ -2207,8 +2298,7 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
       (-sort-by-thread (eq -sort-by-thread 'descend)))
     (when arrow-uid
       (save-excursion
-        (if (-vtable-find-object (lambda (m) (eq (-message-uid m)
-                                                 arrow-uid)))
+        (if (-vtable-find-object (lambda (m) (eq (-message-uid m) arrow-uid)))
             (move-marker overlay-arrow-position (point))
           (setq overlay-arrow-position nil))))
     (-vtable-find-object (lambda (m) (eq (-message-uid m) point-uid))))
@@ -2248,7 +2338,7 @@ MENU and CLICK are as expected of a member of `context-menu-functions'."
                 (colnames (-settings-alist-get :mailbox-columns mailbox))
                 (sortnames (-settings-alist-get :mailbox-sort-by mailbox)))
            (make-vtable
-            :objects-function (lambda () (or -message-list '(((uid . 0)))))
+            :objects-function (lambda () (or -message-list '(())))
             :columns (mapcar (lambda (v)
                                (alist-get v minimail-mailbox-mode-column-alist))
                              colnames)
@@ -2335,6 +2425,26 @@ many message, otherwise use `minimail-fetch-limit'."
   (interactive "p" minimail-mailbox-mode minimail-message-mode)
   (minimail-next-message (- count)))
 
+(defun minimail-next-message-unseen (direction)
+  (interactive "p" minimail-mailbox-mode minimail-message-mode)
+  (with-current-buffer (-find-buffer 'mailbox)
+    (if (not overlay-arrow-position)
+        (goto-char (point-min))
+      (goto-char overlay-arrow-position))
+    (unless (-vtable-find-object
+             (lambda (msg)
+               (not (assoc-string '\\Seen (-message-flags msg))))
+             (cl-signum direction))
+      (user-error "No unseen messages %s"
+                  (if (minusp direction) 'above 'below)))
+    (when-let* ((window (get-buffer-window)))
+      (set-window-point window (point)))
+    (minimail-show-message)))
+
+(defun minimail-previous-message-unseen (direction)
+  (interactive "p" minimail-mailbox-mode minimail-message-mode)
+  (minimail-next-message-unseen (- direction)))
+
 (defun minimail-quit-message-window (&optional kill)
   "If there is a window showing a message from this mailbox, quit it.
 If KILL is non-nil, kill the message buffer instead of burying it."
@@ -2368,8 +2478,8 @@ prefix argument."
                       (query (mapcar
                               (lambda (it) (or (car (member it flags)) it))
                               (completing-read-multiple
-                               (format "%s flags: " (cond ((cl-plusp how) "Add")
-                                                          ((cl-minusp how) "Remove")
+                               (format "%s flags: " (cond ((plusp how) "Add")
+                                                          ((minusp how) "Remove")
                                                           (t "Toggle")))
                                flags nil t))))
                  (list (-selected-messages)
@@ -2382,8 +2492,8 @@ prefix argument."
                                          -message-list)))
                       (assoc-string flag (-message-flags msg)))))
            (remove
-            (cond ((cl-plusp how) nil)
-                  ((cl-minusp how) t)
+            (cond ((plusp how) nil)
+                  ((minusp how) t)
                   (t (seq-every-p flagp (ensure-list set))))))
       (athunk-run
        (-astore-message-flags -current-mailbox set flag remove)))))
@@ -2432,11 +2542,11 @@ envelope and doesn't use server-side threading information."
   (let* ((result (make-hash-table))
          (msgids (make-hash-table :test #'equal))) ;map Message-ID -> msg
     (dolist (msg messages)
-      (when-let* ((msgid (alist-get 'message-id (-message-envelope msg))))
+      (when-let* ((msgid (-message-message-id msg)))
         (puthash msgid msg msgids)))
     (dolist (msg messages)
       (when-let*
-          ((inreply (alist-get 'in-reply-to (-message-envelope msg)))
+          ((inreply (-message-in-reply-to msg))
            (inreply (when (string-match "<.*?>" inreply)
                       (match-string-no-properties 0 inreply)))
            (parent (gethash inreply msgids)))
@@ -2450,12 +2560,17 @@ envelope and doesn't use server-side threading information."
 
 (defun -thread-data ()
   (with-memoization -thread-data
-    (funcall (pcase-exhaustive
-                 (-settings-scalar-get :thread-style -current-mailbox)
-               ('shallow #'-thread-data-shallow)
-               ('hierarchical #'-thread-data-hierarchical)
-               ('nil (lambda (_) (make-hash-table))))
-             -message-list)))
+    (funcall
+     (pcase-exhaustive
+         (or (-settings-scalar-get :thread-style -current-mailbox)
+             (let ((caps (athunk-run-polling
+                          (-aget-capability (car -current-mailbox))
+                          :interval 0.1 :max-tries 100)))
+               (if (or (memq 'objectid caps) (memq 'x-gm-ext-1 caps))
+                   'shallow 'hierarchical)))
+       ('shallow #'-thread-data-shallow)
+       ('hierarchical #'-thread-data-hierarchical))
+     -message-list)))
 
 (defun -thread-parent (message)
   "The parent of MESSAGE in the thread tree."
@@ -2509,7 +2624,7 @@ style.  If DESCEND is non-nil, use the opposite convention."
                         (t (min i j)))))
           (puthash root k rootpos))
         (push msg messages)
-        (cl-incf i)
+        (incf i)
         (forward-line)))
     (setq -message-list (sort messages :key key :in-place t))
     ;; Little hack to force vtable to redisplay with our new sorting.
@@ -2545,14 +2660,18 @@ or t to toggle between those options."
 (easy-menu-define nil minimail-message-mode-map
   "Menu for `minimail-message-mode'."
   ;; TODO: Add the content of the context menu for messages here.
-  '("Message"
+  `("Message"
     ["Reply" minimail-reply]
     ["Reply All" minimail-reply-all]
     ["Forward" minimail-forward]
-    ["Search Messages" minimail-search
-     :help "Search for messages in this mailbox"]
-    ["Compose New Message" compose-mail
-     :help "Start writing a new mail message"]))
+    ("Mailing List"
+     ["Copy Permalink" minimail-message-archived-at
+      :active (minimail-message-archived-at)]
+     ["Browse List Archives" minimail-message-list-archive
+      :active (minimail-message-list-archive)]
+     ["Unsubscribe" minimail-message-list-unsubscribe
+      :active (minimail-message-list-unsubscribe)])
+    ,@-base-menu))
 
 (define-derived-mode minimail-message-mode special-mode "Message"
   "Major mode for email messages."
@@ -2583,6 +2702,26 @@ window shorter than 6 lines."
     (direction . below)
     (window-height . -message-window-adjust-height)))
 
+(defun -all-headers ()
+  (let (headers)
+    (save-restriction
+      (message-narrow-to-head)
+      (while (re-search-forward "^\\([^ \t:]+\\):" nil t)
+        (let ((key (downcase (match-string 1)))
+              (value (string-trim
+                      (replace-regexp-in-string
+                       "\n[\t ]+" " "
+                       (buffer-substring-no-properties
+                        (point)
+                        (re-search-forward "^\\<\\|\\'"))))))
+          (push value (alist-get key headers nil nil #'equal)))))
+    (dolist (it headers)
+      (cl-callf nreverse (cdr it)))
+    (nreverse headers)))
+
+(defvar-local -adisplay-message nil
+  "Synchronization data for the function of same name.")
+
 (defun -adisplay-message (mailbox uid)
   "Display the message identified by MAILBOX and UID.
 Return an athunk which yields the buffer displaying the message.
@@ -2596,8 +2735,7 @@ the user selected another message in the meanwhile, yield nil."
       (unless (derived-mode-p #'minimail-message-mode)
         (minimail-message-mode))
       (-set-mode-line-suffix 'loading)
-      (setf (alist-get 'next-message -local-state)
-            (list mailbox uid)))
+      (setq -adisplay-message (cons uid mailbox)))
     (display-buffer buffer -display-message-base-action)
     (athunk-let*
         ((text <- (athunk-condition-case err
@@ -2607,27 +2745,14 @@ the user selected another message in the meanwhile, yield nil."
                        (signal (car err) (cdr err))))))
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
-          (when (equal (alist-get 'next-message -local-state)
-                       (list mailbox uid))
+          (when (equal -adisplay-message (cons uid mailbox))
             (let ((inhibit-read-only t))
               (-set-mode-line-suffix nil)
               (funcall -message-erase-function)
-              (setq -current-mailbox mailbox)
-              (setf (alist-get 'uid -local-state) uid)
               (rename-buffer (-message-buffer-name mailbox uid) t)
               (decode-coding-string text 'raw-text-dos nil buffer)
-              (setf (alist-get 'headers -local-state)
-                    (save-restriction
-                      (message-narrow-to-headers-or-head)
-                      (mapcan
-                       (lambda (k)
-                         (when-let* ((v (message-fetch-field (symbol-name k))))
-                           `((,k . ,(mail-decode-encoded-word-string v)))))
-                       '( from to cc subject date message-id references
-                          ;; Funny stuff used to compute the
-                          ;; recipients of a reply:
-                          mail-copies-to mail-followup-to mail-reply-to
-                          original-to reply-to))))
+              (setq -current-mailbox mailbox)
+              (setq -message-list `(((uid . ,uid) (headers . ,(-all-headers)))))
               (funcall render)
               (set-buffer-modified-p nil)
               (when-let* ((window (get-buffer-window (current-buffer))))
@@ -2652,24 +2777,28 @@ the user selected another message in the meanwhile, yield nil."
   (interactive "^P" minimail-message-mode minimail-mailbox-mode)
   (minimail-message-scroll-up arg t))
 
+;;;; Reply and forward
+
 (defun -reply-recipients (headers wide)
   "Compute recipients of a reply from the original message HEADERS."
   ;; We really want to reuse the rather complex logic of
   ;; `message-get-reply-headers' which, sadly, reads headers from the
   ;; current buffer.  At the same time, we want to honor buffer-local
-  ;; values of variables such as `user-mail-address'.  So use the
+  ;; values of variables such as `user-mail-address'.  So we use the
   ;; current buffer (a message buffer) as scratch area.
   (save-restriction
     (widen)
     (goto-char (point-min))
-    (pcase-dolist (`(,key . ,value) headers)
-      (when value
-        (insert (symbol-name key) ": " value ?\n)))
+    (pcase-dolist (`(,key . ,values) headers)
+      (when (assoc-string key '( from to cc reply-to subject
+                                 mail-copies-to mail-followup-to
+                                 mail-reply-to original-to))
+        (dolist (value values)
+          (insert key ": " (mail-decode-encoded-word-string value) ?\n))))
     (insert ?\n)
     (let ((end (point-marker)))
       (prog1
-          (or (funcall (if wide
-                           message-wide-reply-to-function
+          (or (funcall (if wide message-wide-reply-to-function
                          message-reply-to-function))
               (message-get-reply-headers wide))
         (delete-region (point-min) end)))))
@@ -2686,8 +2815,8 @@ the user selected another message in the meanwhile, yield nil."
                                         (-message-uid (-current-message))))))
      (set-buffer (or buffer (user-error "No message buffer")))
      (let ((mailbox -current-mailbox)
-           (uid (alist-get 'uid -local-state))
-           (headers (alist-get 'headers -local-state)))
+           (uid (alist-get 'uid (car -message-list)))
+           (headers (alist-get 'headers (car -message-list))))
        (-compose-mail                   ;this changes current buffer
         nil nil nil nil nil buffer
         `((funcall ,(lambda ()
@@ -2695,13 +2824,18 @@ the user selected another message in the meanwhile, yield nil."
                          (-astore-message-flags mailbox uid '\\Answered))))))
        (pcase-dolist (`(,key . ,value) (-reply-recipients headers wide))
          (message-replace-header (symbol-name key) value))
-       (let-alist headers
-         (message-replace-header
-          "Subject" (concat "Re: " (message-simplify-subject .subject)))
-         (message-replace-header
-          "In-Reply-To" .message-id)
-         (message-replace-header
-          "References" (concat .references (when .references " ") .message-id)))
+       (message-replace-header
+        "Subject" (concat "Re: "
+                          (message-simplify-subject
+                           (mail-decode-encoded-word-string
+                            (cadr (assoc-string 'subject headers))))))
+       (message-replace-header
+        "In-Reply-To" (cadr (assoc-string 'message-id headers)))
+       (message-replace-header
+        "References" (concat
+                      (cadr (assoc-string 'references headers))
+                      (when (assoc-string 'references headers) " ")
+                      (cadr (assoc-string 'message-id headers))))
        (message-sort-headers)
        (message-hide-headers)
        (setq buffer-undo-list nil)
@@ -2726,7 +2860,7 @@ the user selected another message in the meanwhile, yield nil."
                                         (-message-uid (-current-message))))))
      (set-buffer (or buffer (user-error "No message buffer")))
      (let* ((mailbox -current-mailbox)
-            (uid (alist-get 'uid -local-state))
+            (uid (alist-get 'uid (car -message-list)))
             (message-forward-decoded-p t)
             (subject (message-make-forward-subject)))
        (-compose-mail                   ;this changes current buffer
@@ -2735,6 +2869,48 @@ the user selected another message in the meanwhile, yield nil."
                         (athunk-run
                          (-astore-message-flags mailbox uid '$Forwarded))))))
        (message-forward-make-body buffer)))))
+
+;;;; Mailing list commands
+
+(defun -act-on-header-url (action key)
+  (let* ((headers (alist-get 'headers (car -message-list)))
+         (url (cadr (assoc-string key headers))))
+    (when url (setq url (string-trim url "<" ">.*")))
+    (when (and action (not url))
+      (user-error "Message has no %s header" (capitalize (symbol-name key))))
+    (pcase action
+      ('copy
+       (message "Copied `%s'" url)
+       (kill-new url))
+      ('browse
+       (when (or (string-prefix-p "mailto:" url)
+                 (y-or-n-p (format "%s\nBrowse this URL?" url)))
+         (browse-url url))))
+    url))
+
+(defun minimail-message-archived-at (&optional action)
+  "Get an archival URL for this message.
+Interactively, copy the URL to kill ring or, with a prefix argument,
+browse it."
+  (interactive (list (if current-prefix-arg 'browse 'copy))
+               minimail-message-mode)
+  (-act-on-header-url action 'archived-at))
+
+(defun minimail-message-list-unsubscribe (&optional action)
+  "Get the mailing list unsubscription URL.
+Interactively, browse the URL or, with a prefix argument, copy it to the
+kill ring."
+  (interactive (list (if current-prefix-arg 'copy 'browse))
+               minimail-message-mode)
+  (-act-on-header-url action 'list-unsubscribe))
+
+(defun minimail-message-list-archive (&optional action)
+  "Get the mailing list archive URL.
+Interactively, browse the URL or, with a prefix argument, copy it to the
+kill ring."
+  (interactive (list (if current-prefix-arg 'copy 'browse))
+               minimail-message-mode)
+  (-act-on-header-url action 'list-archive))
 
 ;;;; Gnus graft
 ;; Cf. `mu4e--view-render-buffer' from mu4e-view.el
@@ -2789,6 +2965,10 @@ the user selected another message in the meanwhile, yield nil."
   ":" #'minimail-execute-server-command
   "s" #'minimail-search
   "c" #'compose-mail)
+
+(easy-menu-define nil minimail-overview-mode-map
+  "Menu for `minimail-overview-mode'."
+  `("Minimail" ,@-base-menu))
 
 (define-derived-mode minimail-overview-mode special-mode "Minimail"
   "Major mode for browsing a mailbox tree."
@@ -2915,11 +3095,17 @@ Unless REFRESH is non-nil, use cached mailbox information."
 ;;; MUA definition
 
 ;;;###autoload
-(define-mail-user-agent 'minimail
-  #'-compose-mail
-  #'message-send-and-exit
-  #'message-kill-buffer
-  'message-send-hook)
+(progn
+  (define-mail-user-agent 'minimail
+    #'-compose-mail
+    #'message-send-and-exit
+    #'message-kill-buffer
+    'message-send-hook)
+  ;; Probably can't use `cl-pushnew' here.
+  (let ((item '(const :tag "Minimail" minimail))
+        (items (get 'mail-user-agent 'custom-type)))
+    (unless (member item items)
+      (push item (cdr items)))))
 
 ;;;###autoload
 (defun -compose-mail (&rest args)
@@ -2939,10 +3125,12 @@ Unless REFRESH is non-nil, use cached mailbox information."
                               (mapcar #'cdr addr))))
                         minimail-accounts))))
          (hook (lambda ()
-                 (setq-local
-                  -current-mailbox mailbox
-                  user-mail-address address
-                  user-full-name (-settings-scalar-get :full-name mailbox))
+                 (setq -current-mailbox mailbox)
+                 (pcase-let
+                     ((`(,addr . ,name) (-split-mail-address address)))
+                   (setq-local user-mail-address addr)
+                   (when name
+                     (setq-local user-full-name name)))
                  (pcase (-settings-scalar-get :signature mailbox)
                    (`(file ,fname . nil)
                     (setq-local message-signature t
@@ -2955,21 +3143,6 @@ Unless REFRESH is non-nil, use cached mailbox information."
         (remove-hook 'message-mode-hook hook)))
     (message-sort-headers)
     (message-position-point)
-    (unless (seq-some (pcase-lambda (`(,cond . ,_))
-                        (or (functionp cond)
-                            (and (stringp cond)
-                                 (string-equal-ignore-case
-                                  cond user-mail-address))))
-                      message-server-alist)
-      (save-excursion
-        (lwarn 'minimail :warning "\
-No entry of `message-server-alist' matches the
-address %S.
-%s this variable to be able to send messages."
-               user-mail-address
-               (buttonize "Customize"
-                          #'customize-variable
-                          'message-server-alist))))
     t))
 
 ;;; Completion framework integration
